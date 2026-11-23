@@ -343,7 +343,7 @@ fn publish(hub: &Hub, atoms: &Atoms, target: u32, data: Vec<u8>, last_image: &mu
         msg.push(0x04);
         msg.extend_from_slice(&data);
         let b = Bytes::from(msg);
-        hub.broadcast(|| Out::Bin(b.clone()));
+        hub.broadcast_clipboard(|| Out::Bin(b.clone()));
         return;
     }
     let Ok(text) = String::from_utf8(data) else {
@@ -360,7 +360,7 @@ fn publish(hub: &Hub, atoms: &Atoms, target: u32, data: Vec<u8>, last_image: &mu
         *last = Some(text.clone());
     }
     let msg = serde_json::json!({"t": "clip", "d": text}).to_string();
-    hub.broadcast(|| Out::Text(msg.clone()));
+    hub.broadcast_clipboard(|| Out::Text(msg.clone()));
 }
 
 fn send_cursor(conn: &RustConnection, hub: &Hub) {

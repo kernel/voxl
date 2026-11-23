@@ -24,6 +24,8 @@ pub struct Client {
     pub tx: mpsc::UnboundedSender<Out>,
     pub video: AtomicBool,
     pub audio: AtomicBool,
+    /// Only watches: its input is dropped and it isn't sent the clipboard.
+    pub read_only: bool,
     pub inflight: Mutex<VecDeque<Inflight>>,
     /// Smoothed min RTT (ms), from pings.
     pub min_rtt_ms: AtomicU32,
@@ -301,12 +303,13 @@ impl Hub {
         self.waker.drain();
     }
 
-    pub fn add_client(&self, tx: mpsc::UnboundedSender<Out>) -> Arc<Client> {
+    pub fn add_client(&self, tx: mpsc::UnboundedSender<Out>, read_only: bool) -> Arc<Client> {
         let c = Arc::new(Client {
             id: self.next_id.fetch_add(1, Ordering::Relaxed),
             tx,
             video: AtomicBool::new(false),
             audio: AtomicBool::new(false),
+            read_only,
             inflight: Mutex::new(VecDeque::new()),
             min_rtt_ms: AtomicU32::new(0),
             delivered: Mutex::new(RateEst {
@@ -341,8 +344,14 @@ impl Hub {
     }
 
     /// The `hello` message: current geometry plus the server's settings.
-    pub fn hello(&self) -> String {
+    pub fn hello(&self, c: &Client) -> String {
         let mut m = self.hello_extra.lock().clone();
+        if c.read_only {
+            m.insert("readOnly".into(), true.into());
+            if let Some(files) = m.get_mut("files") {
+                files["upload"] = false.into();
+            }
+        }
         m.insert("t".into(), "hello".into());
         m.insert("w".into(), self.width.load(Ordering::Relaxed).into());
         m.insert("h".into(), self.height.load(Ordering::Relaxed).into());
@@ -353,17 +362,23 @@ impl Hub {
     /// After the stream restarts (new size): every client needs the new geometry and
     /// a keyframe, and acks for the old stream's frames no longer apply.
     pub fn restart_clients(&self) {
-        let hello = self.hello();
         for c in self.clients.lock().iter() {
             c.inflight.lock().clear();
             c.started.store(false, Ordering::Relaxed);
             c.needs_keyframe.store(true, Ordering::Relaxed);
-            c.send(Out::Text(hello.clone()));
+            c.send(Out::Text(self.hello(c)));
         }
     }
 
     pub fn broadcast(&self, m: impl Fn() -> Out) {
         for c in self.clients.lock().iter() {
+            c.send(m());
+        }
+    }
+
+    /// The desktop's clipboard, to the viewers that may read it: not read-only ones.
+    pub fn broadcast_clipboard(&self, m: impl Fn() -> Out) {
+        for c in self.clients.lock().iter().filter(|c| !c.read_only) {
             c.send(m());
         }
     }

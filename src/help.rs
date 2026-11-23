@@ -26,6 +26,9 @@ Login:
                                 made up and printed at startup)
   --basic-auth-user             the user name a browser's sign-in has to give
                                 (default: any)
+  --control-password            only viewers whose socket URL has ?password= this
+                                drive; the rest watch, as with --read-only
+                                (default: $VOXL_CONTROL_PASSWORD, else none: all drive)
 
 Video:
   --framerate                   max frames per second (default 60)

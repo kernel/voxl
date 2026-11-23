@@ -315,7 +315,7 @@ fn clipboard_loop(hub: Arc<Hub>, state: Arc<Mutex<ClipState>>) {
                 *last = Some(text.clone());
             }
             let msg = serde_json::json!({"t": "clip", "d": text}).to_string();
-            hub.broadcast(|| Out::Text(msg.clone()));
+            hub.broadcast_clipboard(|| Out::Text(msg.clone()));
             continue;
         }
         let data = if has(png) {
@@ -345,7 +345,7 @@ fn clipboard_loop(hub: Arc<Hub>, state: Arc<Mutex<ClipState>>) {
         msg.push(0x04);
         msg.extend_from_slice(&data);
         let b = Bytes::from(msg);
-        hub.broadcast(|| Out::Bin(b.clone()));
+        hub.broadcast_clipboard(|| Out::Bin(b.clone()));
     }
 }
 

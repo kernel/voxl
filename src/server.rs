@@ -3,12 +3,13 @@
 use crate::hub::{Client, Hub, Out};
 use crate::input::InputEvent;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use bytes::Bytes;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -26,6 +27,9 @@ pub struct AppState {
     pub resize: bool,
     /// Viewers only watch: input, clipboard writes and the microphone are refused (--read-only).
     pub read_only: bool,
+    /// Only a viewer whose socket URL has `?password=` this drives; the rest only watch
+    /// (--control-password).
+    pub control_password: Option<String>,
     pub recorder: Arc<crate::record::Recorder>,
     /// The web client's page, with its title filled in (`index_html`).
     pub index: Bytes,
@@ -203,12 +207,27 @@ async fn stats(State(s): State<AppState>) -> Response {
         .into_response()
 }
 
-async fn ws_handler(ws: WebSocketUpgrade, State(s): State<AppState>) -> Response {
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(s): State<AppState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let read_only = s.read_only || !may_drive(s.control_password.as_deref(), &q);
     ws.max_message_size(64 << 20)
-        .on_upgrade(move |socket| handle_socket(socket, s))
+        .on_upgrade(move |socket| handle_socket(socket, s, read_only))
 }
 
-async fn handle_socket(socket: WebSocket, s: AppState) {
+/// Without a control password every viewer drives. With one, only a socket opened with
+/// it as `?password=` (the parameter neko clients sign in with, which a proxy in front
+/// can set per viewer) does.
+fn may_drive(want: Option<&str>, q: &HashMap<String, String>) -> bool {
+    want.is_none_or(|want| {
+        q.get("password")
+            .is_some_and(|given| crate::login::same(given, want))
+    })
+}
+
+async fn handle_socket(socket: WebSocket, s: AppState, read_only: bool) {
     use futures_util::{SinkExt, StreamExt};
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Out>();
@@ -220,10 +239,10 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
         if input.is_none() && s.hub.input_floor.load(Ordering::Relaxed) != 0 {
             return;
         }
-        s.hub.add_client(tx)
+        s.hub.add_client(tx, read_only)
     };
     log::info!("client {} connected", client.id);
-    client.send(Out::Text(s.hub.hello()));
+    client.send(Out::Text(s.hub.hello(&client)));
     if let Some(c) = s.hub.cursor.lock().clone() {
         client.send(Out::Bin(c));
     }
@@ -266,7 +285,7 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
             Message::Text(t) => handle_text(&s, &client, t.as_str(), &mut rtts),
             // Every binary message from a viewer acts on the desktop (clipboard images,
             // microphone audio), so a read-only viewer's are all dropped.
-            Message::Binary(_) if s.read_only => {}
+            Message::Binary(_) if client.read_only => {}
             // 0x11: clipboard image (PNG) pasted on the client.
             Message::Binary(b) if b.first() == Some(&0x11) && b.len() > 1 => {
                 send_input(
@@ -324,10 +343,10 @@ const READ_ONLY_COMMANDS: &[&str] = &["a", "v", "au", "kf", "po"];
 
 fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collections::VecDeque<u32>) {
     let (cmd, rest) = t.split_once(',').unwrap_or((t, ""));
-    // --read-only: accept only what watching needs, right where commands are applied,
-    // so a client that ignores the hello flag cannot drive the desktop, whatever
-    // commands are added later.
-    if s.read_only && !READ_ONLY_COMMANDS.contains(&cmd) {
+    // Read-only viewers: accept only what watching needs, right where commands are
+    // applied, so a client that ignores the hello flag cannot drive the desktop,
+    // whatever commands are added later.
+    if c.read_only && !READ_ONLY_COMMANDS.contains(&cmd) {
         return;
     }
     let input = |ev| send_input(&s.hub, c, ev);
@@ -343,7 +362,7 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
                             log::warn!("display switch: {e}");
                         }
                         c.needs_keyframe.store(true, Ordering::Relaxed);
-                        c.send(Out::Text(s.hub.hello()));
+                        c.send(Out::Text(s.hub.hello(c)));
                         s.hub.wake();
                     }
                 }
@@ -502,14 +521,15 @@ mod tests {
             }),
             mic: Some(mic_tx),
             resize: true,
-            read_only,
+            read_only: false,
+            control_password: None,
             recorder: crate::record::Recorder::new(hub.clone(), Duration::from_secs(1)),
             index: Bytes::new(),
             favicon: Bytes::new(),
             favicon_type: "image/x-icon",
         };
         let (tx, _rx) = mpsc::unbounded_channel();
-        let client = hub.add_client(tx);
+        let client = hub.add_client(tx, read_only);
         let mut rtts = Default::default();
         for c in ALL {
             handle_text(&s, &client, c, &mut rtts);
@@ -541,6 +561,36 @@ mod tests {
     }
 
     #[test]
+    fn only_the_control_password_drives() {
+        let q = |p: &str| HashMap::from([("password".to_string(), p.to_string())]);
+        assert!(may_drive(Some("admin"), &q("admin")));
+        assert!(!may_drive(Some("admin"), &q("view")));
+        assert!(!may_drive(Some("admin"), &HashMap::new()));
+        assert!(may_drive(None, &HashMap::new()));
+    }
+
+    #[test]
+    fn read_only_viewers_are_told_so_and_not_sent_the_clipboard() {
+        let hub = Hub::new();
+        hub.hello_extra
+            .lock()
+            .insert("files".into(), serde_json::json!({"upload": true}));
+        let (tx, mut viewer) = mpsc::unbounded_channel();
+        let ro = hub.add_client(tx, true);
+        let (tx, mut driver) = mpsc::unbounded_channel();
+        let rw = hub.add_client(tx, false);
+        let hello = |c| serde_json::from_str::<serde_json::Value>(&hub.hello(c)).unwrap();
+        assert_eq!(hello(&ro)["readOnly"], true);
+        assert_eq!(hello(&ro)["files"]["upload"], false);
+        assert_eq!(hello(&rw).get("readOnly"), None);
+        assert_eq!(hello(&rw)["files"]["upload"], true);
+
+        hub.broadcast_clipboard(|| Out::Text("clip".into()));
+        assert!(viewer.try_recv().is_err());
+        assert!(driver.try_recv().is_ok());
+    }
+
+    #[test]
     fn favicon_uses_file_extension_for_content_type() {
         let (bytes, content_type) = favicon(None).unwrap();
         assert_eq!(content_type, "image/x-icon");
@@ -565,7 +615,7 @@ mod tests {
         let (sender, events) = std::sync::mpsc::channel();
         *hub.input.lock() = Some(sender);
         let (out, _messages) = mpsc::unbounded_channel();
-        let old = hub.add_client(out);
+        let old = hub.add_client(out, false);
         send_input(&hub, &old, InputEvent::Move { x: 1, y: 2 });
         let request = hub.pause_display_input(20, old.id).unwrap();
         assert!(
@@ -601,7 +651,7 @@ mod tests {
         );
         assert!(hub.pause_display_input(30, old.id).is_none());
         let (out, _messages) = mpsc::unbounded_channel();
-        let fresh = hub.add_client(out);
+        let fresh = hub.add_client(out, false);
         send_input(&hub, &fresh, InputEvent::Move { x: 3, y: 4 });
         assert!(matches!(
             events.try_recv(),

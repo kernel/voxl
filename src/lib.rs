@@ -353,6 +353,12 @@ async fn serve(a: HashMap<String, String>) {
         mic,
         resize: enable_resize && !read_only,
         read_only,
+        // --control-password: viewers that connect with it drive, the rest only watch.
+        control_password: a
+            .get("control-password")
+            .cloned()
+            .or_else(|| std::env::var("VOXL_CONTROL_PASSWORD").ok())
+            .filter(|p| !p.is_empty()),
         // GET /screenshot, /record; --max-record-seconds caps a recording's length.
         recorder: record::Recorder::new(
             hub.clone(),
