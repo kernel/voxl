@@ -199,11 +199,9 @@ id=$(curl -u ":$VOXL_PASSWORD" -s -X POST localhost:6901/record/start | jq .id)
 curl -u ":$VOXL_PASSWORD" -o clip.mp4 -X POST "localhost:6901/record/stop?id=$id"
 ```
 
-A recording saves the existing H.264 video in MP4 without re-encoding it. When desktop
-audio is enabled and available, it includes a separate Opus audio track (add `audio=0` to
-`/record` or `/record/start` to leave it out); recording audio uses its own encoder so live
-viewers still skip silent audio. It doesn't include the cursor (viewers draw it), and a
-resize ends it.
+A recording is the H.264 voxl already sends to viewers, saved as MP4 without encoding
+it again, plus the desktop audio as Opus when audio is on (`audio=0` leaves it out). It
+doesn't include the cursor (viewers draw it), and a resize ends it.
 
 `/wait` returns when the screen settles or changes, so an agent doesn't have to sleep
 after every action and hope it was long enough:

@@ -197,11 +197,8 @@ async fn collect(
                     });
                 }
                 Some(Out::RecordingAudio(data, captured)) => {
-                    let ms = if captured >= start {
-                        captured.duration_since(start).as_millis().min(i64::MAX as u128) as i64
-                    } else {
-                        -(start.duration_since(captured).as_millis().min(i64::MAX as u128) as i64)
-                    };
+                    let ms = captured.saturating_duration_since(start).as_millis() as i64
+                        - start.saturating_duration_since(captured).as_millis() as i64;
                     audio.push(mp4::AudioPacket { ms, data });
                 }
                 // A capture restart or closed subscription ends this recording.
@@ -212,21 +209,12 @@ async fn collect(
         }
     }
     let end = start.elapsed().as_millis() as u64;
-    tokio::task::spawn_blocking(move || {
-        mp4::write_with_audio(
-            &frames,
-            size.0,
-            size.1,
-            end,
-            &audio,
-            frames.first().map_or(0, |f| f.ms),
-        )
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    tokio::task::spawn_blocking(move || mp4::write(&frames, size.0, size.1, end, &audio))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
-/// Whether a recording asked to leave desktop audio out (`audio=0` or `audio=false`).
+/// Whether a recording includes desktop audio: unless asked for `audio=0` or `audio=false`.
 fn audio(q: &HashMap<String, String>) -> bool {
     !matches!(q.get("audio").map(String::as_str), Some("0" | "false"))
 }

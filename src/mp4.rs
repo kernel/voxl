@@ -67,19 +67,13 @@ fn u32s(v: &[u32]) -> Vec<u8> {
 const MATRIX: [u32; 9] = [0x10000, 0, 0, 0, 0x10000, 0, 0, 0, 0x4000_0000];
 
 /// Writes `frames` (the first must be a keyframe) as an MP4 of `width`x`height`
-/// lasting until `end_ms`.
-#[cfg(test)]
-pub fn write(frames: &[Frame], width: u32, height: u32, end_ms: u64) -> Result<Vec<u8>, String> {
-    write_with_audio(frames, width, height, end_ms, &[], 0)
-}
-
-pub fn write_with_audio(
+/// lasting until `end_ms`, with the `audio` that overlaps the video.
+pub fn write(
     frames: &[Frame],
     width: u32,
     height: u32,
     end_ms: u64,
     audio: &[AudioPacket],
-    video_start_ms: u64,
 ) -> Result<Vec<u8>, String> {
     let first = frames.first().ok_or("no frames were recorded")?;
     if !first.key {
@@ -124,13 +118,9 @@ pub fn write_with_audio(
     let total: u64 = durations.iter().map(|&d| d as u64).sum();
     let n = frames.len() as u32;
     let video_len: u64 = sizes.iter().map(|&s| s as u64).sum();
-    let audio_edits = audio_edits(audio, video_start_ms, total);
-    let audio_present = !audio_edits.is_empty();
-    let audio_len = if audio_present {
-        audio.iter().map(|p| p.data.len() as u64).sum::<u64>()
-    } else {
-        0
-    };
+    let audio_edits = audio_edits(audio, first.ms, total);
+    let audio = if audio_edits.is_empty() { &[] } else { audio };
+    let audio_len: u64 = audio.iter().map(|p| p.data.len() as u64).sum();
     let mdat_len = video_len + audio_len;
 
     let ftyp = bx(b"ftyp", b"isom\0\0\x02\0isomiso2avc1mp41");
@@ -216,11 +206,12 @@ pub fn write_with_audio(
     mvhd.extend_from_slice(&[0u8; 8]);
     mvhd.extend_from_slice(&u32s(&MATRIX));
     mvhd.extend_from_slice(&[0u8; 24]); // pre-defined
-    mvhd.extend_from_slice(&u32s(&[if audio_present { 3 } else { 2 }])); // next track id
-    let audio_trak = if audio_present {
-        audio_track(audio, &audio_edits, total)
-    } else {
+    let tracks = if audio.is_empty() { 1 } else { 2 };
+    mvhd.extend_from_slice(&u32s(&[tracks + 1])); // next track id
+    let audio_trak = if audio.is_empty() {
         Vec::new()
+    } else {
+        audio_track(audio, &audio_edits, total)
     };
     let mut moov = bx(
         b"moov",
@@ -228,21 +219,21 @@ pub fn write_with_audio(
     );
 
     let offset = (ftyp.len() + moov.len() + 8) as u32;
-    // The video and audio each occupy one contiguous chunk in mdat.
+    // The video, then the audio, each occupy one chunk in mdat. Each track's stco has one
+    // chunk offset, its last 4 bytes.
     let stco: Vec<usize> = moov
         .windows(16)
         .enumerate()
-        .filter_map(|(i, b)| (b == b"\0\0\0\x14stco\0\0\0\0\0\0\0\x01").then_some(i + 4))
+        .filter_map(|(i, b)| (b == b"\0\0\0\x14stco\0\0\0\0\0\0\0\x01").then_some(i + 16))
         .collect();
-    if stco.len() != if audio_present { 2 } else { 1 } {
+    if stco.len() != tracks as usize {
         return Err("invalid chunk offsets".into());
     }
-    moov[stco[0] + 12..stco[0] + 16].copy_from_slice(&offset.to_be_bytes());
-    if audio_present {
-        let audio_offset = offset
-            .checked_add(video_len as u32)
-            .ok_or("recording too large")?;
-        moov[stco[1] + 12..stco[1] + 16].copy_from_slice(&audio_offset.to_be_bytes());
+    let audio_offset = offset
+        .checked_add(video_len as u32)
+        .ok_or("recording too large")?;
+    for (at, chunk) in stco.into_iter().zip([offset, audio_offset]) {
+        moov[at..at + 4].copy_from_slice(&chunk.to_be_bytes());
     }
     let mut out = Vec::with_capacity(offset as usize + mdat_len as usize);
     out.extend_from_slice(&ftyp);
@@ -253,78 +244,73 @@ pub fn write_with_audio(
         out.extend_from_slice(&(n.len() as u32).to_be_bytes());
         out.extend_from_slice(n);
     }
-    if audio_present {
-        for packet in audio {
-            out.extend_from_slice(&packet.data);
-        }
+    for packet in audio {
+        out.extend_from_slice(&packet.data);
     }
     Ok(out)
 }
 
 fn audio_track(audio: &[AudioPacket], edit_list: &[(u32, i32)], movie_ms: u64) -> Vec<u8> {
-    let duration = (audio.len() as u32).saturating_mul(480);
-    let mut dops = vec![0, 2]; // version, stereo
-    dops.extend_from_slice(&312u16.to_be_bytes()); // Opus encoder lookahead at 48 kHz
-    dops.extend_from_slice(&48000u32.to_be_bytes());
-    dops.extend_from_slice(&0i16.to_be_bytes()); // output gain
-    dops.push(0); // channel mapping family
-    let mut opus = vec![0; 6];
-    opus.extend_from_slice(&1u16.to_be_bytes()); // data reference
-    opus.extend_from_slice(&[0; 8]);
-    opus.extend_from_slice(&2u16.to_be_bytes());
-    opus.extend_from_slice(&16u16.to_be_bytes());
-    opus.extend_from_slice(&[0; 4]);
-    opus.extend_from_slice(&(48000u32 << 16).to_be_bytes());
+    let n = audio.len() as u32;
+    // Version 0, stereo, pre-skip 312 (the encoder's lookahead), 48 kHz, no gain, family 0.
+    let dops = [
+        &[0, 2][..],
+        &312u16.to_be_bytes(),
+        &48000u32.to_be_bytes(),
+        &[0; 3],
+    ]
+    .concat();
+    let mut opus = vec![0, 0, 0, 0, 0, 0, 0, 1]; // reserved, data reference index
+    opus.extend_from_slice(&u32s(&[0, 0, 2 << 16 | 16, 0, 48000 << 16])); // stereo, 16-bit
     opus.extend_from_slice(&bx(b"dOps", &dops));
     let stsd = fbx(b"stsd", 0, &[u32s(&[1]), bx(b"Opus", &opus)].concat());
-    let stts = fbx(b"stts", 0, &u32s(&[1, audio.len() as u32, 480]));
-    let stsz = fbx(
-        b"stsz",
-        0,
-        &[
-            u32s(&[0, audio.len() as u32]),
-            u32s(
-                &audio
-                    .iter()
-                    .map(|p| p.data.len() as u32)
-                    .collect::<Vec<_>>(),
-            ),
-        ]
-        .concat(),
-    );
-    let stsc = fbx(b"stsc", 0, &u32s(&[1, 1, audio.len() as u32, 1]));
-    let stco = fbx(b"stco", 0, &u32s(&[1, 0]));
-    let stbl = bx(b"stbl", &[stsd, stts, stsz, stsc, stco].concat());
+    let sizes: Vec<u32> = audio.iter().map(|p| p.data.len() as u32).collect();
+    let stbl = [
+        stsd,
+        fbx(b"stts", 0, &u32s(&[1, n, 480])),
+        fbx(b"stsz", 0, &[u32s(&[0, n]), u32s(&sizes)].concat()),
+        fbx(b"stsc", 0, &u32s(&[1, 1, n, 1])),
+        fbx(b"stco", 0, &u32s(&[1, 0])),
+    ];
     let dinf = bx(
         b"dinf",
         &fbx(b"dref", 0, &[u32s(&[1]), fbx(b"url ", 1, &[])].concat()),
     );
-    let minf = bx(b"minf", &[fbx(b"smhd", 0, &[0; 4]), dinf, stbl].concat());
-    let mut hdlr = u32s(&[0]);
-    hdlr.extend_from_slice(b"soun");
-    hdlr.extend_from_slice(&[0; 12]);
-    hdlr.extend_from_slice(b"voxl audio\0");
-    let mut mdhd = u32s(&[0, 0, 48000, duration]);
-    mdhd.extend_from_slice(&[0x55, 0xc4, 0, 0]);
-    let mdia = bx(
-        b"mdia",
-        &[fbx(b"mdhd", 0, &mdhd), fbx(b"hdlr", 0, &hdlr), minf].concat(),
+    let minf = bx(
+        b"minf",
+        &[fbx(b"smhd", 0, &[0; 4]), dinf, bx(b"stbl", &stbl.concat())].concat(),
     );
-    let mut tkhd = u32s(&[0, 0, 2, 0, movie_ms as u32, 0, 0]);
-    tkhd.extend_from_slice(&[0; 4]);
-    tkhd.extend_from_slice(&[1, 0, 0, 0]); // audio volume
-    tkhd.extend_from_slice(&u32s(&MATRIX));
-    tkhd.extend_from_slice(&u32s(&[0, 0]));
-    let mut edit_body = u32s(&[edit_list.len() as u32]);
-    for (duration, media_time) in edit_list {
-        edit_body.extend_from_slice(&duration.to_be_bytes());
-        edit_body.extend_from_slice(&media_time.to_be_bytes());
-        edit_body.extend_from_slice(&[0, 1, 0, 0]); // media rate 1.0
-    }
-    let edits = fbx(b"elst", 0, &edit_body);
+    let hdlr = [&u32s(&[0])[..], b"soun", &[0; 12], b"voxl audio\0"].concat();
+    let mdhd = [
+        u32s(&[0, 0, 48000, n.saturating_mul(480)]),
+        vec![0x55, 0xc4, 0, 0],
+    ]
+    .concat();
+    let mdia = [fbx(b"mdhd", 0, &mdhd), fbx(b"hdlr", 0, &hdlr), minf].concat();
+    let tkhd = [
+        u32s(&[0, 0, 2, 0, movie_ms as u32, 0, 0, 0]),
+        vec![1, 0, 0, 0], // volume 1.0
+        u32s(&MATRIX),
+        u32s(&[0, 0]),
+    ];
+    // Each edit: movie duration, media start (-1 for an empty edit), rate 1.0.
+    let elst: Vec<u32> = edit_list
+        .iter()
+        .flat_map(|&(d, t)| [d, t as u32, 0x10000])
+        .collect();
+    let elst = fbx(
+        b"elst",
+        0,
+        &[u32s(&[edit_list.len() as u32]), u32s(&elst)].concat(),
+    );
     bx(
         b"trak",
-        &[fbx(b"tkhd", 3, &tkhd), bx(b"edts", &edits), mdia].concat(),
+        &[
+            fbx(b"tkhd", 3, &tkhd.concat()),
+            bx(b"edts", &elst),
+            bx(b"mdia", &mdia),
+        ]
+        .concat(),
     )
 }
 
@@ -418,7 +404,7 @@ mod tests {
                 data: delta,
             },
         ];
-        let out = write(&frames, 64, 32, 100).unwrap();
+        let out = write(&frames, 64, 32, 100, &[]).unwrap();
         let pos = |t: &[u8]| out.windows(4).position(|w| w == t).unwrap();
         assert!(pos(b"moov") < pos(b"mdat"));
         let stco = pos(b"stco");
@@ -430,6 +416,14 @@ mod tests {
             &[0, 0, 0, 2, 0x65, 0xaa, 0, 0, 0, 3, 0x41, 0xbb, 0xcc]
         );
     }
+    /// Packets at these times, each holding its time twice as its bytes.
+    fn packets(ms: &[i64]) -> Vec<AudioPacket> {
+        let data = |ms: i64| bytes::Bytes::from(vec![ms as u8; 2]);
+        ms.iter()
+            .map(|&ms| AudioPacket { ms, data: data(ms) })
+            .collect()
+    }
+
     #[test]
     fn audio_track_offsets_follow_video_and_preserve_packets() {
         let frame = Frame {
@@ -439,53 +433,25 @@ mod tests {
                 0, 0, 0, 1, 0x67, 100, 0, 40, 0xac, 0, 0, 0, 1, 0x68, 0xee, 0, 0, 0, 1, 0x65, 0xaa,
             ]),
         };
-        let audio = [
-            AudioPacket {
-                ms: 20,
-                data: bytes::Bytes::from_static(&[0xf8, 0xff, 0xfe]),
-            },
-            AudioPacket {
-                ms: 30,
-                data: bytes::Bytes::from_static(&[0x12, 0x34]),
-            },
-        ];
-        let out = write_with_audio(&[frame], 64, 32, 100, &audio, 0).unwrap();
-        let offsets: Vec<_> = out
-            .windows(4)
-            .enumerate()
-            .filter_map(|(i, b)| (b == b"stco").then_some(i))
+        let out = write(&[frame], 64, 32, 100, &packets(&[20, 30])).unwrap();
+        let offset = |stco: usize| {
+            u32::from_be_bytes(out[stco + 12..stco + 16].try_into().unwrap()) as usize
+        };
+        let chunks: Vec<_> = (0..out.len() - 4)
+            .filter(|&i| &out[i..i + 4] == b"stco")
+            .map(offset)
             .collect();
-        assert_eq!(offsets.len(), 2);
-        let offset = |i| u32::from_be_bytes(out[i + 12..i + 16].try_into().unwrap()) as usize;
-        assert_eq!(
-            &out[offset(offsets[0])..offset(offsets[0]) + 6],
-            &[0, 0, 0, 2, 0x65, 0xaa]
-        );
-        assert_eq!(&out[offset(offsets[1])..], &[0xf8, 0xff, 0xfe, 0x12, 0x34]);
-        assert!(out.windows(4).any(|b| b == b"dOps"));
+        assert_eq!(&out[chunks[0]..chunks[1]], &[0, 0, 0, 2, 0x65, 0xaa]);
+        assert_eq!(&out[chunks[1]..], &[20, 20, 30, 30]);
     }
 
     #[test]
     fn audio_edits_trim_before_video_and_preserve_capture_gaps() {
-        let before_video: Vec<_> = (-1000..=0)
-            .step_by(10)
-            .map(|ms| AudioPacket {
-                ms,
-                data: bytes::Bytes::new(),
-            })
-            .collect();
+        let before_video = packets(&(-1000..=0).step_by(10).collect::<Vec<_>>());
         assert_eq!(audio_edits(&before_video, 0, 100), vec![(10, 48_000)]);
         assert!(audio_edits(&before_video[..100], 0, 100).is_empty());
-
-        let with_gap: Vec<_> = [0, 10, 40, 50]
-            .into_iter()
-            .map(|ms| AudioPacket {
-                ms,
-                data: bytes::Bytes::new(),
-            })
-            .collect();
         assert_eq!(
-            audio_edits(&with_gap, 0, 100),
+            audio_edits(&packets(&[0, 10, 40, 50]), 0, 100),
             vec![(20, 0), (20, -1), (20, 960)]
         );
     }

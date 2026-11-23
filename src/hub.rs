@@ -56,6 +56,11 @@ impl Client {
         let _ = self.tx.send(m);
     }
 
+    /// Listening, or recording with audio: desktop audio has to be captured.
+    pub fn wants_audio(&self) -> bool {
+        self.audio.load(Ordering::Relaxed) || self.recording_audio.load(Ordering::Relaxed)
+    }
+
     pub fn on_ack(&self, id: u32) {
         let mut q = self.inflight.lock();
         let mut acked = 0;

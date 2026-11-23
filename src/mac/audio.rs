@@ -158,11 +158,7 @@ pub fn spawn(_device: String, bitrate: i32, hub: Arc<Hub>) {
                 pending: Vec::with_capacity(FRAME * 4),
                 out: vec![0u8; 4000],
             }));
-            let want = || {
-                hub.clients.lock().iter().any(|c| {
-                    c.audio.load(Ordering::Relaxed) || c.recording_audio.load(Ordering::Relaxed)
-                })
-            };
+            let want = || hub.clients.lock().iter().any(|c| c.wants_audio());
             loop {
                 if !want() {
                     std::thread::sleep(Duration::from_millis(200));

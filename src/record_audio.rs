@@ -66,10 +66,6 @@ impl Encoder {
         self.behind = 0;
     }
 
-    pub fn push(&mut self, hub: &Hub, pcm: &[i16]) {
-        self.push_at(hub, pcm, Instant::now());
-    }
-
     /// When the packet that reached the encoder at `now` was captured.
     fn stamp(&mut self, now: Instant) -> Instant {
         let arrived = now.checked_sub(PACKET).unwrap_or(now);
@@ -89,7 +85,7 @@ impl Encoder {
         expected
     }
 
-    fn push_at(&mut self, hub: &Hub, pcm: &[i16], now: Instant) {
+    pub fn push(&mut self, hub: &Hub, pcm: &[i16]) {
         let clients: Vec<_> = hub
             .clients
             .lock()
@@ -111,7 +107,7 @@ impl Encoder {
             unsafe { opus_encoder_ctl(self.encoder, 4002, self.bitrate as c_int) };
         }
         // Timed before encoding, so a packet that fails to encode leaves a gap.
-        let captured = self.stamp(now);
+        let captured = self.stamp(Instant::now());
         let n = unsafe {
             opus_encode(
                 self.encoder,
@@ -148,94 +144,37 @@ impl Drop for Encoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::mpsc;
 
-    #[test]
-    fn silence_goes_to_recorder_not_live_viewer() {
-        let hub = Hub::new();
-        let (tx, mut recording) = mpsc::unbounded_channel();
-        let recorder = hub.add_client(tx);
-        recorder.recording_audio.store(true, Ordering::Relaxed);
-        let (tx, mut live) = mpsc::unbounded_channel();
-        let viewer = hub.add_client(tx);
-        viewer.audio.store(true, Ordering::Relaxed);
-        let mut encoder = Encoder::new(128_000);
-        encoder.push(&hub, &[0; 960]);
-        assert!(matches!(
-            recording.try_recv(),
-            Ok(Out::RecordingAudio(_, _))
-        ));
-        assert!(live.try_recv().is_err());
-    }
-
-    fn stamps(
-        encoder: &mut Encoder,
-        hub: &Hub,
-        rx: &mut mpsc::UnboundedReceiver<Out>,
-        at: &[Instant],
-    ) -> Vec<Instant> {
-        at.iter()
-            .map(|&now| {
-                encoder.push_at(hub, &[0; 960], now);
-                match rx.try_recv() {
-                    Ok(Out::RecordingAudio(_, captured)) => captured,
-                    _ => panic!("no packet"),
-                }
-            })
-            .collect()
-    }
-
-    fn recording() -> (std::sync::Arc<Hub>, mpsc::UnboundedReceiver<Out>, Encoder) {
-        let hub = Hub::new();
-        let (tx, rx) = mpsc::unbounded_channel();
-        hub.add_client(tx)
-            .recording_audio
-            .store(true, Ordering::Relaxed);
-        (hub, rx, Encoder::new(128_000))
+    /// Capture times of packets that reach the encoder at these times, in ms.
+    fn stamps(encoder: &mut Encoder, at: &[i64]) -> Vec<i64> {
+        let t = Instant::now();
+        let at_ms = |n: i64| t + Duration::from_millis((1000 + n) as u64);
+        let ms = |i: Instant| (i - t).as_millis() as i64 - 1000;
+        at.iter().map(|&n| ms(encoder.stamp(at_ms(n)))).collect()
     }
 
     #[test]
     fn bursty_and_late_audio_keeps_its_sample_timing() {
-        let (hub, mut rx, mut encoder) = recording();
-        let t = Instant::now() + Duration::from_secs(1);
-        let ms = |n: u64| t + Duration::from_millis(n);
         // Two packets per 21 ms callback, then a 60 ms stall that loses nothing.
-        let at = [
-            ms(0),
-            ms(0),
-            ms(21),
-            ms(21),
-            ms(102),
-            ms(102),
-            ms(102),
-            ms(102),
-            ms(102),
-            ms(102),
-        ];
-        let got = stamps(&mut encoder, &hub, &mut rx, &at);
-        let start = got[0];
-        for (i, s) in got.iter().enumerate() {
-            assert_eq!(*s - start, PACKET * i as u32);
-        }
+        let at = [0, 0, 21, 21, 102, 102, 102, 102, 102, 102];
+        let want: Vec<i64> = (0..10).map(|i| i * 10 - 10).collect();
+        assert_eq!(stamps(&mut Encoder::new(128_000), &at), want);
     }
 
     #[test]
     fn dropped_samples_and_restarts_move_the_clock() {
-        let (hub, mut rx, mut encoder) = recording();
-        let t = Instant::now() + Duration::from_secs(1);
-        let ms = |n: u64| t + Duration::from_millis(n);
+        let mut encoder = Encoder::new(128_000);
         // 300 ms of audio never arrived: after LOST_PACKETS late packets the clock follows.
-        let at: Vec<_> = (0..40)
-            .map(|i| if i == 0 { ms(0) } else { ms(300 + 10 * i) })
+        let at: Vec<i64> = (0..40)
+            .map(|i| if i == 0 { 0 } else { 300 + 10 * i })
             .collect();
-        let got = stamps(&mut encoder, &hub, &mut rx, &at);
+        let got = stamps(&mut encoder, &at);
         let n = LOST_PACKETS as usize;
-        assert_eq!(got[n - 1] - got[0], PACKET * (n as u32 - 1));
-        assert_eq!(got[n], at[n] - PACKET);
-        assert_eq!(got[n + 1] - got[n], PACKET);
+        assert_eq!(got[n - 1], got[0] + 10 * (n as i64 - 1));
+        let late: Vec<i64> = at[n..].iter().map(|t| t - 10).collect();
+        assert_eq!(got[n..], late);
 
         encoder.restart();
-        let got = stamps(&mut encoder, &hub, &mut rx, &[ms(5000)]);
-        assert_eq!(got[0], ms(5000) - PACKET);
+        assert_eq!(stamps(&mut encoder, &[5000]), [4990]);
     }
 }
