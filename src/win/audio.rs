@@ -276,6 +276,7 @@ pub fn spawn(device_name: String, bitrate: i32, hub: Arc<Hub>) {
                 });
                 let r = device(id.as_deref()).and_then(|d| capture(&d, &mut encoder, &hub, &want));
                 encoder.pending.clear();
+                encoder.recorder.restart();
                 if let Err(e) = r {
                     log::warn!("audio capture failed ({e}); retrying");
                     std::thread::sleep(Duration::from_secs(2));

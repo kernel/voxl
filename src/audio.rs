@@ -151,6 +151,7 @@ pub fn spawn(device: String, bitrate: i32, hub: Arc<Hub>) {
                     }
                 }
                 pa_simple_free(s);
+                recorder.restart();
                 log::info!("audio capture stopped");
             }
         })

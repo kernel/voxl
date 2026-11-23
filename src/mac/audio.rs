@@ -212,7 +212,9 @@ pub fn spawn(_device: String, bitrate: i32, hub: Arc<Hub>) {
                     std::thread::sleep(Duration::from_millis(200));
                 }
                 drop(s);
-                encoder.lock().pending.clear();
+                let mut e = encoder.lock();
+                e.pending.clear();
+                e.recorder.restart();
                 log::info!("audio capture stopped");
             }
         })

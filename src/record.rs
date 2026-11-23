@@ -5,6 +5,8 @@
 //! - `POST /record/start` -> `{"id": n}`, then `POST /record/stop?id=n`: returns an MP4
 //!   of everything in between.
 //!
+//! Both include desktop audio when it's enabled, unless asked for `audio=0`.
+//!
 //! A recording is the H.264 stream voxl already encodes, rewrapped as MP4: the recorder
 //! joins as one more viewer that acknowledges frames at once, so it costs almost no
 //! CPU and never slows real viewers down. Like the stream, it holds frames only when
@@ -137,6 +139,7 @@ fn begin(
     r: &Arc<Recorder>,
     stop: oneshot::Receiver<()>,
     max: Duration,
+    audio: bool,
 ) -> Result<tokio::task::JoinHandle<Result<Vec<u8>, String>>, Response> {
     if r.hub.stripes.lock().len() > 1 {
         return Err(err(
@@ -147,7 +150,7 @@ fn begin(
     let (tx, rx) = mpsc::unbounded_channel();
     let client = r.hub.add_client(tx);
     client.video.store(true, Ordering::Relaxed);
-    client.recording_audio.store(true, Ordering::Relaxed);
+    client.recording_audio.store(audio, Ordering::Relaxed);
     r.hub.wake();
     let hub = r.hub.clone();
     Ok(tokio::spawn(async move {
@@ -223,6 +226,11 @@ async fn collect(
     .map_err(|e| e.to_string())?
 }
 
+/// Whether a recording asked to leave desktop audio out (`audio=0` or `audio=false`).
+fn audio(q: &HashMap<String, String>) -> bool {
+    !matches!(q.get("audio").map(String::as_str), Some("0" | "false"))
+}
+
 /// How long `GET /record?seconds=` records: `secs`, at most `max`. None unless positive.
 fn record_len(secs: f64, max: Duration) -> Option<Duration> {
     if secs.is_nan() || secs <= 0.0 {
@@ -243,7 +251,7 @@ pub async fn record(
     };
     // The deadline ends it; the stop side is never used.
     let (_keep, stop) = oneshot::channel();
-    let done = match begin(&r, stop, len) {
+    let done = match begin(&r, stop, len, audio(&q)) {
         Ok(d) => d,
         Err(e) => return e,
     };
@@ -254,9 +262,12 @@ pub async fn record(
     }
 }
 
-pub async fn start(State(r): State<Arc<Recorder>>) -> Response {
+pub async fn start(
+    State(r): State<Arc<Recorder>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
     let (stop_tx, stop) = oneshot::channel();
-    let done = match begin(&r, stop, r.max) {
+    let done = match begin(&r, stop, r.max, audio(&q)) {
         Ok(d) => d,
         Err(e) => return e,
     };
