@@ -5,6 +5,10 @@
 //! - `POST /record/start` -> `{"id": n}`, then `POST /record/stop?id=n`: returns an MP4
 //!   of everything in between.
 //!
+//! Both include desktop audio when the server has it (`--audio-enabled`, the default),
+//! unless asked for `audio=0`, as a live viewer keeps audio on until it turns it off.
+//! `/record/start` reports whether its recording includes audio.
+//!
 //! A recording is the H.264 stream voxl already encodes, rewrapped as MP4: the recorder
 //! joins as one more viewer that acknowledges frames at once, so it costs almost no
 //! CPU and never slows real viewers down. Like the stream, it holds frames only when
@@ -15,6 +19,7 @@ use crate::mp4;
 use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
+use bytes::Bytes;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,6 +35,8 @@ pub struct Recorder {
     pub hub: Arc<Hub>,
     /// Longest recording; a started one stops on its own after this.
     pub max: Duration,
+    /// Whether the server captures desktop audio at all (`--audio-enabled`).
+    pub audio: bool,
     active: Mutex<HashMap<u64, Active>>,
     next: AtomicU64,
 }
@@ -40,10 +47,11 @@ struct Active {
 }
 
 impl Recorder {
-    pub fn new(hub: Arc<Hub>, max: Duration) -> Arc<Self> {
+    pub fn new(hub: Arc<Hub>, max: Duration, audio: bool) -> Arc<Self> {
         Arc::new(Recorder {
             hub,
             max,
+            audio,
             active: Mutex::new(HashMap::new()),
             next: AtomicU64::new(1),
         })
@@ -137,6 +145,7 @@ fn begin(
     r: &Arc<Recorder>,
     stop: oneshot::Receiver<()>,
     max: Duration,
+    with_audio: bool,
 ) -> Result<tokio::task::JoinHandle<Result<Vec<u8>, String>>, Response> {
     if r.hub.stripes.lock().len() > 1 {
         return Err(err(
@@ -148,18 +157,29 @@ fn begin(
     let client = r.hub.add_client(tx);
     client.video.store(true, Ordering::Relaxed);
     r.hub.wake();
+    let audio = r.hub.subscribe_audio(with_audio);
     let hub = r.hub.clone();
     Ok(tokio::spawn(async move {
-        let res = collect(&hub, &client, rx, stop, max).await;
+        let res = collect(&hub, &client, rx, audio, with_audio, stop, max).await;
         hub.remove_client(client.id);
         res
     }))
+}
+
+/// Milliseconds from `start` to `at`, negative when `at` comes first.
+fn offset_ms(at: Instant, start: Instant) -> i64 {
+    match at.checked_duration_since(start) {
+        Some(later) => later.as_millis() as i64,
+        None => -(start.duration_since(at).as_millis() as i64),
+    }
 }
 
 async fn collect(
     hub: &Hub,
     client: &Client,
     mut rx: mpsc::UnboundedReceiver<Out>,
+    mut audio: mpsc::UnboundedReceiver<(Instant, Bytes)>,
+    with_audio: bool,
     mut stop: oneshot::Receiver<()>,
     max: Duration,
 ) -> Result<Vec<u8>, String> {
@@ -167,11 +187,15 @@ async fn collect(
     let deadline = tokio::time::sleep(max);
     tokio::pin!(deadline);
     let mut frames: Vec<mp4::Frame> = Vec::new();
+    let mut packets: Vec<mp4::AudioPacket> = Vec::new();
     let mut size = (0, 0);
     loop {
         tokio::select! {
             _ = &mut stop => break,
             _ = &mut deadline => break,
+            Some((at, data)) = audio.recv(), if with_audio => {
+                packets.push(mp4::AudioPacket { ms: offset_ms(at, start), data });
+            }
             m = rx.recv() => match m {
                 None => break,
                 Some(Out::Bin(b)) if b.len() > 16 && b[0] == 0x01 => {
@@ -199,9 +223,14 @@ async fn collect(
         }
     }
     let end = start.elapsed().as_millis() as u64;
-    tokio::task::spawn_blocking(move || mp4::write(&frames, size.0, size.1, end))
+    tokio::task::spawn_blocking(move || mp4::write(&frames, size.0, size.1, end, &packets))
         .await
         .map_err(|e| e.to_string())?
+}
+
+/// Whether the request keeps desktop audio: unless `audio=0` or `audio=false`.
+fn audio_wanted(q: &HashMap<String, String>) -> bool {
+    !matches!(q.get("audio").map(String::as_str), Some("0" | "false"))
 }
 
 /// How long `GET /record?seconds=` records: `secs`, at most `max`. None unless positive.
@@ -224,7 +253,7 @@ pub async fn record(
     };
     // The deadline ends it; the stop side is never used.
     let (_keep, stop) = oneshot::channel();
-    let done = match begin(&r, stop, len) {
+    let done = match begin(&r, stop, len, r.audio && audio_wanted(&q)) {
         Ok(d) => d,
         Err(e) => return e,
     };
@@ -235,9 +264,13 @@ pub async fn record(
     }
 }
 
-pub async fn start(State(r): State<Arc<Recorder>>) -> Response {
+pub async fn start(
+    State(r): State<Arc<Recorder>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
     let (stop_tx, stop) = oneshot::channel();
-    let done = match begin(&r, stop, r.max) {
+    let with_audio = r.audio && audio_wanted(&q);
+    let done = match begin(&r, stop, r.max, with_audio) {
         Ok(d) => d,
         Err(e) => return e,
     };
@@ -261,7 +294,8 @@ pub async fn start(State(r): State<Arc<Recorder>>) -> Response {
     });
     (
         [(header::CONTENT_TYPE, "application/json")],
-        serde_json::json!({ "id": id, "max_seconds": r.max.as_secs() }).to_string(),
+        serde_json::json!({ "id": id, "max_seconds": r.max.as_secs(), "audio": with_audio })
+            .to_string(),
     )
         .into_response()
 }
@@ -286,6 +320,15 @@ pub async fn stop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_is_on_unless_turned_off() {
+        let query = |v: &str| HashMap::from([("audio".to_string(), v.to_string())]);
+        assert!(audio_wanted(&HashMap::new()));
+        assert!(audio_wanted(&query("1")));
+        assert!(!audio_wanted(&query("0")));
+        assert!(!audio_wanted(&query("false")));
+    }
 
     #[test]
     fn record_len_is_positive_and_capped() {

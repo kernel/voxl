@@ -3,78 +3,13 @@
 
 use super::ffi::*;
 use super::stream::{self, OutputType};
-use crate::hub::{Hub, Out};
-use bytes::Bytes;
+use crate::audio_pipeline::{pcm16, Pipeline};
+use crate::hub::Hub;
+use crate::opus;
 use parking_lot::Mutex;
-use std::ffi::{c_int, c_void};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
-
-#[link(name = "opus")]
-extern "C" {
-    fn opus_encoder_create(
-        fs: i32,
-        channels: c_int,
-        application: c_int,
-        error: *mut c_int,
-    ) -> *mut c_void;
-    fn opus_encoder_ctl(st: *mut c_void, request: c_int, ...) -> c_int;
-    fn opus_encode(
-        st: *mut c_void,
-        pcm: *const i16,
-        frame_size: c_int,
-        data: *mut u8,
-        max: i32,
-    ) -> i32;
-}
-
-const RATE: u32 = 48000;
-const FRAME: usize = 480;
-
-struct Encoder {
-    enc: *mut c_void,
-    /// Interleaved stereo samples waiting for a whole frame.
-    pending: Vec<i16>,
-    out: Vec<u8>,
-}
-unsafe impl Send for Encoder {}
-
-impl Encoder {
-    fn push(&mut self, hub: &Hub, l: &[f32], r: &[f32]) {
-        for (&a, &b) in l.iter().zip(r) {
-            self.pending.push((a.clamp(-1.0, 1.0) * 32767.0) as i16);
-            self.pending.push((b.clamp(-1.0, 1.0) * 32767.0) as i16);
-        }
-        while self.pending.len() >= FRAME * 2 {
-            let pcm: Vec<i16> = self.pending.drain(..FRAME * 2).collect();
-            if pcm.iter().all(|&s| s == 0) {
-                continue;
-            }
-            let n = unsafe {
-                opus_encode(
-                    self.enc,
-                    pcm.as_ptr(),
-                    FRAME as c_int,
-                    self.out.as_mut_ptr(),
-                    self.out.len() as i32,
-                )
-            };
-            if n <= 0 {
-                continue;
-            }
-            let mut m = Vec::with_capacity(n as usize + 1);
-            m.push(0x02);
-            m.extend_from_slice(&self.out[..n as usize]);
-            let b = Bytes::from(m);
-            for c in hub.clients.lock().iter() {
-                if c.audio.load(Ordering::Relaxed) {
-                    c.send(Out::Bin(b.clone()));
-                }
-            }
-        }
-    }
-}
 
 /// Planar or interleaved float samples of one audio sample buffer as (left, right).
 unsafe fn samples(sb: CMSampleBufferRef) -> Option<(Vec<f32>, Vec<f32>)> {
@@ -143,36 +78,28 @@ pub fn spawn(_device: String, bitrate: i32, hub: Arc<Hub>) {
     std::thread::Builder::new()
         .name("audio".into())
         .spawn(move || {
-            let mut err = 0;
-            let enc = unsafe { opus_encoder_create(RATE as i32, 2, 2051, &mut err) };
-            if enc.is_null() {
-                log::error!("opus init failed: {err}");
-                return;
-            }
-            unsafe { opus_encoder_ctl(enc, 4002, bitrate as c_int) };
-            let encoder = Arc::new(Mutex::new(Encoder {
-                enc,
-                pending: Vec::with_capacity(FRAME * 4),
-                out: vec![0u8; 4000],
-            }));
-            let want = || {
-                hub.clients
-                    .lock()
-                    .iter()
-                    .any(|c| c.audio.load(Ordering::Relaxed))
+            let pipeline = match Pipeline::new(bitrate) {
+                Ok(pipeline) => Arc::new(Mutex::new(pipeline)),
+                Err(e) => {
+                    log::error!("opus init failed: {e}");
+                    return;
+                }
             };
+            let want = || hub.wants_audio();
             loop {
                 if !want() {
                     std::thread::sleep(Duration::from_millis(200));
                     continue;
                 }
-                let (e, h) = (encoder.clone(), hub.clone());
+                let (p, h) = (pipeline.clone(), hub.clone());
                 let on_sample = move |sb: CMSampleBufferRef, ty: OutputType| {
                     if ty != OutputType::Audio {
                         return;
                     }
                     if let Some((l, r)) = unsafe { samples(sb) } {
-                        e.lock().push(&h, &l, &r);
+                        let interleaved =
+                            l.iter().zip(&r).flat_map(|(&a, &b)| [pcm16(a), pcm16(b)]);
+                        p.lock().push(&h, interleaved);
                     }
                 };
                 // Audio rides on a display stream; keep its video as small and rare as possible.
@@ -182,8 +109,8 @@ pub fn spawn(_device: String, bitrate: i32, hub: Arc<Hub>) {
                     &[OutputType::Audio],
                     |cfg| unsafe {
                         cfg.setCapturesAudio(true);
-                        cfg.setSampleRate(RATE as isize);
-                        cfg.setChannelCount(2);
+                        cfg.setSampleRate(opus::RATE as isize);
+                        cfg.setChannelCount(opus::CHANNELS as isize);
                         // voxl plays no audio itself, but a viewer on this Mac would loop.
                         cfg.setExcludesCurrentProcessAudio(true);
                         cfg.setWidth(2);
@@ -210,7 +137,7 @@ pub fn spawn(_device: String, bitrate: i32, hub: Arc<Hub>) {
                     std::thread::sleep(Duration::from_millis(200));
                 }
                 drop(s);
-                encoder.lock().pending.clear();
+                pipeline.lock().restart();
                 log::info!("audio capture stopped");
             }
         })

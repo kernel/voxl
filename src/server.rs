@@ -503,7 +503,7 @@ mod tests {
             mic: Some(mic_tx),
             resize: true,
             read_only,
-            recorder: crate::record::Recorder::new(hub.clone(), Duration::from_secs(1)),
+            recorder: crate::record::Recorder::new(hub.clone(), Duration::from_secs(1), false),
             index: Bytes::new(),
             favicon: Bytes::new(),
             favicon_type: "image/x-icon",

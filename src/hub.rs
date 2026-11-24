@@ -263,6 +263,8 @@ pub struct Hub {
     pub hello_extra: Mutex<serde_json::Map<String, serde_json::Value>>,
     /// Screenshot requests, answered by the capture thread with the current screen.
     pub snapshots: Mutex<Vec<tokio::sync::oneshot::Sender<Arc<crate::record::Snapshot>>>>,
+    /// Recordings that take desktop audio, each fed (capture time, Opus packet).
+    pub audio_recorders: Mutex<Vec<mpsc::UnboundedSender<(Instant, Bytes)>>>,
     /// When each part of the screen last changed (`/wait`).
     pub activity: crate::wait::Activity,
 }
@@ -289,6 +291,7 @@ impl Hub {
             resize_max: Mutex::new(None),
             hello_extra: Mutex::new(serde_json::Map::new()),
             snapshots: Mutex::new(Vec::new()),
+            audio_recorders: Mutex::new(Vec::new()),
             activity: Default::default(),
         })
     }
@@ -329,6 +332,15 @@ impl Hub {
     pub fn remove_client(&self, id: u64) {
         self.clients.lock().retain(|c| c.id != id);
         self.wake();
+    }
+
+    /// A recording's audio: packets arrive here as they are captured, when `on`.
+    pub fn subscribe_audio(&self, on: bool) -> mpsc::UnboundedReceiver<(Instant, Bytes)> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        if on {
+            self.audio_recorders.lock().push(tx);
+        }
+        rx
     }
 
     pub fn video_clients(&self) -> Vec<Arc<Client>> {

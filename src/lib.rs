@@ -7,6 +7,13 @@
 mod access;
 #[cfg(all(target_os = "linux", feature = "pulseaudio"))]
 mod audio;
+// The desktop-audio path, for the platforms that capture it.
+#[cfg(any(
+    all(target_os = "linux", feature = "pulseaudio"),
+    target_os = "macos",
+    windows
+))]
+mod audio_pipeline;
 #[cfg(target_os = "linux")]
 mod capture;
 mod convert;
@@ -25,6 +32,7 @@ mod login;
 mod mac;
 mod mic;
 mod mp4;
+mod opus;
 mod record;
 #[cfg(target_os = "linux")]
 mod screen;
@@ -357,6 +365,7 @@ async fn serve(a: HashMap<String, String>) {
         recorder: record::Recorder::new(
             hub.clone(),
             std::time::Duration::from_secs_f64(range_max(a.get("max-record-seconds"), 300.0)),
+            audio_on,
         ),
         // --title: the browser tab's title.
         index: server::index_html(
