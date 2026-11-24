@@ -25,6 +25,8 @@ let audioPort: MessagePort | null = null;
 let audioTs = 0;
 let wantVideo = true;
 let wantAudio = false;
+let playing = false;
+let stopped = false;
 
 // The screen arrives as independent H.264 stripes, one decoder each. A frame is a
 // set of stripe updates sharing an id; frames are presented whole and in order.
@@ -91,8 +93,9 @@ function connect() {
 	});
 	sock.addEventListener('close', () => {
 		post({ t: 'status', s: 'closed' });
+		playing = false;
 		resetDecoder();
-		setTimeout(connect, 1000);
+		if (!stopped) setTimeout(connect, 1000);
 	});
 	sock.addEventListener('message', (e: MessageEvent<string | ArrayBuffer>) => {
 		if (typeof e.data === 'string') return onText(e.data);
@@ -242,6 +245,10 @@ function flush() {
 					if (ctx && !noDraw) ctx.drawImage(g.frame, 0, g.y);
 					g.frame.close();
 				}
+			if (!playing) {
+				playing = true;
+				post({ t: 'playing' });
+			}
 		}
 		send(cmd.ack(id));
 		st.frames++;
@@ -391,6 +398,10 @@ self.addEventListener('message', (e: MessageEvent<ToWorker>) => {
 				if (m.on) resetDecoder();
 				send(cmd.video(m.on));
 			}
+			break;
+		case 'stop':
+			stopped = true;
+			ws?.close();
 			break;
 		case 'audioPort':
 			audioPort = m.port;

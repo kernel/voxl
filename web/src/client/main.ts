@@ -1,13 +1,14 @@
 // Main thread: layout, input capture, cursor, clipboard, files, microphone and audio.
 // Video decode/paint and the socket live in the worker (worker.ts).
 import { cmd } from '../protocol';
-import type { FromWorker, ToWorker } from '../protocol';
+import type { FromWorker, Hello, ToWorker } from '../protocol';
 import type { App } from './app';
 import { el } from './app';
 import { createAudio } from './audio';
 import { createClipboard } from './clipboard';
 import { createCursor } from './cursor';
 import { createFiles } from './files';
+import { createKernel } from './kernel';
 import { setupKeyboard } from './keyboard';
 import { createMic } from './mic';
 import { setupPointer } from './pointer';
@@ -40,16 +41,23 @@ function main() {
 	window.fps = 0;
 	window.voxlStats = {};
 
+	// The last hello, and the read-only lock the page itself holds (kernel.ts).
+	let hello: Hello | null = null;
+	const kernel = createKernel();
+	let locked = kernel.locked;
+
 	// Browsers only offer WebCodecs on HTTPS pages and localhost, so a page opened over
 	// plain HTTP from another machine can't decode the stream whatever the browser.
 	if (!window.isSecureContext) {
 		statusEl.textContent =
 			'voxl needs HTTPS or localhost: browsers only decode video on secure pages. Serve it over HTTPS, or forward the port and open localhost.';
+		kernel.unsupported();
 		return;
 	}
 	if (!('VideoDecoder' in window) || !canvas.transferControlToOffscreen) {
 		statusEl.textContent =
 			'This browser lacks WebCodecs/OffscreenCanvas support.';
+		kernel.unsupported();
 		return;
 	}
 
@@ -78,7 +86,7 @@ function main() {
 		tools: el('tools'),
 		isMac: /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent),
 		remoteMac: false,
-		readOnly: false,
+		readOnly: locked,
 		inIframe: window !== window.top,
 		desk: { w: 0, h: 0 },
 		view: { scale: 1 },
@@ -107,7 +115,23 @@ function main() {
 	const mic = createMic(app);
 	const resize = createResize(app);
 
+	// Read-only: the server said so in its hello, or the page holds the lock.
+	function applyMode() {
+		app.readOnly = !!hello?.readOnly || locked;
+		app.tools.classList.toggle('read-only', app.readOnly);
+		mic.setup(!!hello?.mic && !app.readOnly);
+		updateDisplays(hello?.displays);
+	}
+
+	kernel.listen((lock) => {
+		if (lock && !app.readOnly) app.send(cmd.releaseAll);
+		locked = lock;
+		applyMode();
+		return app.readOnly;
+	});
+
 	const offscreen = canvas.transferControlToOffscreen();
+	kernel.start(() => post({ t: 'stop' }));
 	post(
 		{ t: 'init', canvas: offscreen, url: wsUrl.href, presentToMain: useVideo },
 		[offscreen]
@@ -121,6 +145,7 @@ function main() {
 		if (on !== videoOn || force) {
 			videoOn = on;
 			post({ t: 'video', on });
+			kernel.video(on);
 		}
 	}
 	document.addEventListener('visibilitychange', () => {
@@ -140,27 +165,35 @@ function main() {
 				video.present(m.parts);
 				break;
 			case 'hello':
+				hello = m;
 				app.desk.w = m.w;
 				app.desk.h = m.h;
 				app.remoteMac = m.os === 'macos';
-				app.readOnly = !!m.readOnly;
-				app.tools.classList.toggle('read-only', app.readOnly);
 				video.build(m.stripes && m.stripes.length ? m.stripes : [[0, m.h]]);
 				video.layout();
 				files.setup(m.files);
-				mic.setup(!!m.mic && !app.readOnly);
-				updateDisplays(m.displays);
+				applyMode();
 				resize.setup(m.resize);
 				statusEl.style.display = 'none';
+				kernel.hello();
+				break;
+			case 'playing':
+				kernel.playing();
 				break;
 			case 'status':
 				if (m.s === 'closed') {
 					app.desk.w = 0;
 					mic.stop();
 					statusEl.style.display = '';
-					statusEl.textContent = 'Reconnecting…';
+					kernel.closed();
+					statusEl.textContent = kernel.ended()
+						? 'Disconnected'
+						: 'Reconnecting…';
 				}
-				if (m.s === 'open') updateVisibility(true);
+				if (m.s === 'open') {
+					kernel.open();
+					updateVisibility(true);
+				}
 				break;
 			case 'cursor':
 				cursor.set(m.buf);

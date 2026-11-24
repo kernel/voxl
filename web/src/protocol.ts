@@ -125,6 +125,8 @@ export interface Stats {
 export type FromWorker =
 	| { t: 'frames'; parts: StripeFrame[] }
 	| { t: 'status'; s: 'open' | 'closed' }
+	/** The first frame since the socket opened was presented. */
+	| { t: 'playing' }
 	| { t: 'cursor'; buf: ArrayBuffer }
 	| { t: 'clipImage'; buf: ArrayBuffer }
 	| { t: 'log'; s: string }
@@ -137,6 +139,8 @@ export type ToWorker =
 	| { t: 'send'; d: string }
 	| { t: 'sendBin'; d: ArrayBuffer }
 	| { t: 'video'; on: boolean }
+	/** Close the socket and stop reconnecting. */
+	| { t: 'stop' }
 	| { t: 'audioPort'; port: MessagePort };
 
 /** Worker -> desktop audio worklet: one decoded chunk, planar. */
