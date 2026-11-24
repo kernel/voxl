@@ -13,6 +13,15 @@ pub enum Out {
     Text(String),
 }
 
+/// What a client may do with the desktop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Access {
+    /// Input, clipboard, microphone, uploads and resizing.
+    Drive,
+    /// Only watches: its input is dropped and it isn't sent the clipboard.
+    Watch,
+}
+
 pub struct Inflight {
     pub id: u32,
     pub sent: Instant,
@@ -24,8 +33,7 @@ pub struct Client {
     pub tx: mpsc::UnboundedSender<Out>,
     pub video: AtomicBool,
     pub audio: AtomicBool,
-    /// Only watches: its input is dropped and it isn't sent the clipboard.
-    pub read_only: bool,
+    pub access: Access,
     pub inflight: Mutex<VecDeque<Inflight>>,
     /// Smoothed min RTT (ms), from pings.
     pub min_rtt_ms: AtomicU32,
@@ -303,13 +311,13 @@ impl Hub {
         self.waker.drain();
     }
 
-    pub fn add_client(&self, tx: mpsc::UnboundedSender<Out>, read_only: bool) -> Arc<Client> {
+    pub fn add_client(&self, tx: mpsc::UnboundedSender<Out>, access: Access) -> Arc<Client> {
         let c = Arc::new(Client {
             id: self.next_id.fetch_add(1, Ordering::Relaxed),
             tx,
             video: AtomicBool::new(false),
             audio: AtomicBool::new(false),
-            read_only,
+            access,
             inflight: Mutex::new(VecDeque::new()),
             min_rtt_ms: AtomicU32::new(0),
             delivered: Mutex::new(RateEst {
@@ -343,11 +351,11 @@ impl Hub {
             .collect()
     }
 
-    /// The `hello` message: current geometry plus the server's settings.
-    pub fn hello(&self, c: &Client) -> String {
+    /// The `hello` message: current geometry plus the server's settings, less what a
+    /// watching client may not use.
+    pub fn hello(&self, access: Access) -> String {
         let mut m = self.hello_extra.lock().clone();
-        // What --read-only sends: no resizing, no uploads.
-        if c.read_only {
+        if access == Access::Watch {
             m.insert("readOnly".into(), true.into());
             m.remove("resize");
             if let Some(files) = m.get_mut("files").and_then(|f| f.as_object_mut()) {
@@ -364,11 +372,16 @@ impl Hub {
     /// After the stream restarts (new size): every client needs the new geometry and
     /// a keyframe, and acks for the old stream's frames no longer apply.
     pub fn restart_clients(&self) {
+        let (drive, watch) = (self.hello(Access::Drive), self.hello(Access::Watch));
         for c in self.clients.lock().iter() {
             c.inflight.lock().clear();
             c.started.store(false, Ordering::Relaxed);
             c.needs_keyframe.store(true, Ordering::Relaxed);
-            c.send(Out::Text(self.hello(c)));
+            let hello = match c.access {
+                Access::Drive => &drive,
+                Access::Watch => &watch,
+            };
+            c.send(Out::Text(hello.clone()));
         }
     }
 
@@ -378,9 +391,14 @@ impl Hub {
         }
     }
 
-    /// The desktop's clipboard, to the viewers that may read it: not read-only ones.
+    /// The desktop's clipboard, to the clients that drive: not to ones that only watch.
     pub fn broadcast_clipboard(&self, m: impl Fn() -> Out) {
-        for c in self.clients.lock().iter().filter(|c| !c.read_only) {
+        for c in self
+            .clients
+            .lock()
+            .iter()
+            .filter(|c| c.access == Access::Drive)
+        {
             c.send(m());
         }
     }

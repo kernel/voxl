@@ -10,7 +10,7 @@
 //! CPU and never slows real viewers down. Like the stream, it holds frames only when
 //! the screen changes, and it doesn't include the cursor (viewers draw it locally).
 
-use crate::hub::{Client, Hub, Out};
+use crate::hub::{Access, Client, Hub, Out};
 use crate::mp4;
 use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
@@ -145,7 +145,7 @@ fn begin(
         ));
     }
     let (tx, rx) = mpsc::unbounded_channel();
-    let client = r.hub.add_client(tx, false);
+    let client = r.hub.add_client(tx, Access::Watch);
     client.video.store(true, Ordering::Relaxed);
     r.hub.wake();
     let hub = r.hub.clone();
