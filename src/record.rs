@@ -17,6 +17,7 @@ use crate::mp4;
 use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
+use bytes::Bytes;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -133,13 +134,31 @@ pub async fn screenshot(State(r): State<Arc<Recorder>>) -> Response {
     }
 }
 
+/// Desktop audio packets for a recording, or none for a video-only one.
+struct AudioIn(Option<mpsc::UnboundedReceiver<(Instant, Bytes)>>);
+
+impl AudioIn {
+    /// The next captured packet. Once the audio ends, or for video-only recordings,
+    /// this waits forever.
+    async fn next(&mut self) -> Option<(Instant, Bytes)> {
+        let Some(rx) = self.0.as_mut() else {
+            return std::future::pending().await;
+        };
+        let packet = rx.recv().await;
+        if packet.is_none() {
+            self.0 = None;
+        }
+        packet
+    }
+}
+
 /// Joins as a viewer and collects frames until `stop`, `max` or a geometry change.
 #[allow(clippy::result_large_err)]
 fn begin(
     r: &Arc<Recorder>,
     stop: oneshot::Receiver<()>,
     max: Duration,
-    audio: bool,
+    with_audio: bool,
 ) -> Result<tokio::task::JoinHandle<Result<Vec<u8>, String>>, Response> {
     if r.hub.stripes.lock().len() > 1 {
         return Err(err(
@@ -150,20 +169,29 @@ fn begin(
     let (tx, rx) = mpsc::unbounded_channel();
     let client = r.hub.add_client(tx);
     client.video.store(true, Ordering::Relaxed);
-    client.recording_audio.store(audio, Ordering::Relaxed);
     r.hub.wake();
+    let audio = AudioIn(with_audio.then(|| r.hub.subscribe_audio()));
     let hub = r.hub.clone();
     Ok(tokio::spawn(async move {
-        let res = collect(&hub, &client, rx, stop, max).await;
+        let res = collect(&hub, &client, rx, audio, stop, max).await;
         hub.remove_client(client.id);
         res
     }))
+}
+
+/// Milliseconds from `start` to `at`, negative when `at` comes first.
+fn offset_ms(at: Instant, start: Instant) -> i64 {
+    match at.checked_duration_since(start) {
+        Some(later) => later.as_millis() as i64,
+        None => -(start.duration_since(at).as_millis() as i64),
+    }
 }
 
 async fn collect(
     hub: &Hub,
     client: &Client,
     mut rx: mpsc::UnboundedReceiver<Out>,
+    mut audio: AudioIn,
     mut stop: oneshot::Receiver<()>,
     max: Duration,
 ) -> Result<Vec<u8>, String> {
@@ -171,12 +199,17 @@ async fn collect(
     let deadline = tokio::time::sleep(max);
     tokio::pin!(deadline);
     let mut frames: Vec<mp4::Frame> = Vec::new();
-    let mut audio: Vec<mp4::AudioPacket> = Vec::new();
+    let mut packets: Vec<mp4::AudioPacket> = Vec::new();
     let mut size = (0, 0);
     loop {
         tokio::select! {
             _ = &mut stop => break,
             _ = &mut deadline => break,
+            captured = audio.next() => {
+                if let Some((at, data)) = captured {
+                    packets.push(mp4::AudioPacket { ms: offset_ms(at, start), data });
+                }
+            }
             m = rx.recv() => match m {
                 None => break,
                 Some(Out::Bin(b)) if b.len() > 16 && b[0] == 0x01 => {
@@ -196,11 +229,6 @@ async fn collect(
                         data: b.slice(16..),
                     });
                 }
-                Some(Out::RecordingAudio(data, captured)) => {
-                    let ms = captured.saturating_duration_since(start).as_millis() as i64
-                        - start.saturating_duration_since(captured).as_millis() as i64;
-                    audio.push(mp4::AudioPacket { ms, data });
-                }
                 // A capture restart or closed subscription ends this recording.
                 Some(Out::Text(t)) if !frames.is_empty()
                     && (t.contains("\"hello\"") || t.contains("\"close\"")) => break,
@@ -209,7 +237,7 @@ async fn collect(
         }
     }
     let end = start.elapsed().as_millis() as u64;
-    tokio::task::spawn_blocking(move || mp4::write(&frames, size.0, size.1, end, &audio))
+    tokio::task::spawn_blocking(move || mp4::write(&frames, size.0, size.1, end, &packets))
         .await
         .map_err(|e| e.to_string())?
 }

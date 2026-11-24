@@ -7,6 +7,13 @@
 mod access;
 #[cfg(all(target_os = "linux", feature = "pulseaudio"))]
 mod audio;
+// The desktop-audio path, for the platforms that capture it.
+#[cfg(any(
+    all(target_os = "linux", feature = "pulseaudio"),
+    target_os = "macos",
+    windows
+))]
+mod audio_pipeline;
 #[cfg(target_os = "linux")]
 mod capture;
 mod convert;
@@ -25,7 +32,13 @@ mod login;
 mod mac;
 mod mic;
 mod mp4;
+mod opus;
 mod record;
+#[cfg(any(
+    all(target_os = "linux", feature = "pulseaudio"),
+    target_os = "macos",
+    windows
+))]
 mod record_audio;
 #[cfg(target_os = "linux")]
 mod screen;
