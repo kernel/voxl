@@ -346,10 +346,12 @@ impl Hub {
     /// The `hello` message: current geometry plus the server's settings.
     pub fn hello(&self, c: &Client) -> String {
         let mut m = self.hello_extra.lock().clone();
+        // What --read-only sends: no resizing, no uploads.
         if c.read_only {
             m.insert("readOnly".into(), true.into());
-            if let Some(files) = m.get_mut("files") {
-                files["upload"] = false.into();
+            m.remove("resize");
+            if let Some(files) = m.get_mut("files").and_then(|f| f.as_object_mut()) {
+                files.insert("upload".into(), false.into());
             }
         }
         m.insert("t".into(), "hello".into());

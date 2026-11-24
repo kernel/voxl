@@ -311,7 +311,11 @@ async fn handle_socket(socket: WebSocket, s: AppState, read_only: bool) {
     }
     pinger.abort();
     writer.abort();
-    send_input(&s.hub, &client, InputEvent::ReleaseAll);
+    // Releasing every held key and button acts on the desktop, so a read-only viewer
+    // leaving must not end a driver's drag.
+    if !client.read_only {
+        send_input(&s.hub, &client, InputEvent::ReleaseAll);
+    }
     if let Some(tx) = &s.mic {
         let _ = tx.send(crate::mic::MicMsg::Stop(client.id));
     }
@@ -572,9 +576,11 @@ mod tests {
     #[test]
     fn read_only_viewers_are_told_so_and_not_sent_the_clipboard() {
         let hub = Hub::new();
-        hub.hello_extra
-            .lock()
-            .insert("files".into(), serde_json::json!({"upload": true}));
+        {
+            let mut extra = hub.hello_extra.lock();
+            extra.insert("files".into(), serde_json::json!({"upload": true}));
+            extra.insert("resize".into(), serde_json::json!({"scale": 1.0}));
+        }
         let (tx, mut viewer) = mpsc::unbounded_channel();
         let ro = hub.add_client(tx, true);
         let (tx, mut driver) = mpsc::unbounded_channel();
@@ -582,8 +588,10 @@ mod tests {
         let hello = |c| serde_json::from_str::<serde_json::Value>(&hub.hello(c)).unwrap();
         assert_eq!(hello(&ro)["readOnly"], true);
         assert_eq!(hello(&ro)["files"]["upload"], false);
+        assert_eq!(hello(&ro).get("resize"), None);
         assert_eq!(hello(&rw).get("readOnly"), None);
         assert_eq!(hello(&rw)["files"]["upload"], true);
+        assert!(hello(&rw).get("resize").is_some());
 
         hub.broadcast_clipboard(|| Out::Text("clip".into()));
         assert!(viewer.try_recv().is_err());
