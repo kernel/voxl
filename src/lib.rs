@@ -371,6 +371,7 @@ async fn serve(a: HashMap<String, String>) {
         recorder: record::Recorder::new(
             hub.clone(),
             std::time::Duration::from_secs_f64(range_max(a.get("max-record-seconds"), 300.0)),
+            audio_on,
         ),
         // --title: the browser tab's title.
         index: server::index_html(

@@ -33,7 +33,9 @@ try {
     '-f', 'lavfi', '-i', 'sine=frequency=880:sample_rate=48000:duration=1',
     '-filter_complex', '[0:a]aformat=channel_layouts=stereo[a];[2:a]aformat=channel_layouts=stereo[b];[a][1:a][b]concat=n=3:v=0:a=1[out]',
     '-map', '[out]', '-y', wav]);
-  const { id } = await (await request('/record/start', 'POST')).json();
+  const started = await (await request('/record/start?audio=1', 'POST')).json();
+  if (started.audio !== true) throw new Error(`recording did not report audio: ${JSON.stringify(started)}`);
+  const { id } = started;
   // Allow capture to start before playing; keep a little padding at each end.
   await sleep(800);
   const player = spawn('paplay', ['--device', PULSE_SINK, wav], { stdio: 'inherit' });
@@ -50,6 +52,14 @@ try {
   }
   if (!streams.some((s) => s.codec_type === 'audio' && s.codec_name === 'opus')) {
     throw new Error(`recording has no Opus audio stream: ${JSON.stringify(streams)}`);
+  }
+  // Without audio=1 a recording is video only, as a viewer hears nothing without au,1.
+  const plain = join(dir, 'plain.mp4');
+  writeFileSync(plain, Buffer.from(await (await request('/record?seconds=1')).arrayBuffer()));
+  const plainStreams = JSON.parse(command('ffprobe', ['-v', 'error', '-show_entries',
+    'stream=codec_name,codec_type', '-of', 'json', plain])).streams;
+  if (plainStreams.some((s) => s.codec_type === 'audio')) {
+    throw new Error(`recording without audio=1 has an audio stream: ${JSON.stringify(plainStreams)}`);
   }
   const decoded = spawnSync('ffmpeg', ['-v', 'error', '-i', mp4, '-map', '0:a:0',
     '-ac', '1', '-ar', '48000', '-f', 'f32le', '-'], { maxBuffer: 16 * 1024 * 1024 });

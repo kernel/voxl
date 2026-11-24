@@ -5,7 +5,9 @@
 //! - `POST /record/start` -> `{"id": n}`, then `POST /record/stop?id=n`: returns an MP4
 //!   of everything in between.
 //!
-//! Both include desktop audio when it's enabled, unless asked for `audio=0`.
+//! Desktop audio is opt-in per request, as it is per viewer on the live stream: add
+//! `audio=1`, and only when the server runs with `--audio-enabled` (the default).
+//! `/record/start` reports whether its recording includes audio.
 //!
 //! A recording is the H.264 stream voxl already encodes, rewrapped as MP4: the recorder
 //! joins as one more viewer that acknowledges frames at once, so it costs almost no
@@ -33,6 +35,8 @@ pub struct Recorder {
     pub hub: Arc<Hub>,
     /// Longest recording; a started one stops on its own after this.
     pub max: Duration,
+    /// Whether the server captures desktop audio at all (`--audio-enabled`).
+    pub audio: bool,
     active: Mutex<HashMap<u64, Active>>,
     next: AtomicU64,
 }
@@ -43,10 +47,11 @@ struct Active {
 }
 
 impl Recorder {
-    pub fn new(hub: Arc<Hub>, max: Duration) -> Arc<Self> {
+    pub fn new(hub: Arc<Hub>, max: Duration, audio: bool) -> Arc<Self> {
         Arc::new(Recorder {
             hub,
             max,
+            audio,
             active: Mutex::new(HashMap::new()),
             next: AtomicU64::new(1),
         })
@@ -242,9 +247,9 @@ async fn collect(
         .map_err(|e| e.to_string())?
 }
 
-/// Whether a recording includes desktop audio: unless asked for `audio=0` or `audio=false`.
-fn audio(q: &HashMap<String, String>) -> bool {
-    !matches!(q.get("audio").map(String::as_str), Some("0" | "false"))
+/// Whether the request asks for desktop audio: `audio=1`, as the live stream's `au,1`.
+fn audio_requested(q: &HashMap<String, String>) -> bool {
+    q.get("audio").map(String::as_str) == Some("1")
 }
 
 /// How long `GET /record?seconds=` records: `secs`, at most `max`. None unless positive.
@@ -267,7 +272,7 @@ pub async fn record(
     };
     // The deadline ends it; the stop side is never used.
     let (_keep, stop) = oneshot::channel();
-    let done = match begin(&r, stop, len, audio(&q)) {
+    let done = match begin(&r, stop, len, r.audio && audio_requested(&q)) {
         Ok(d) => d,
         Err(e) => return e,
     };
@@ -283,7 +288,8 @@ pub async fn start(
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
     let (stop_tx, stop) = oneshot::channel();
-    let done = match begin(&r, stop, r.max, audio(&q)) {
+    let with_audio = r.audio && audio_requested(&q);
+    let done = match begin(&r, stop, r.max, with_audio) {
         Ok(d) => d,
         Err(e) => return e,
     };
@@ -307,7 +313,8 @@ pub async fn start(
     });
     (
         [(header::CONTENT_TYPE, "application/json")],
-        serde_json::json!({ "id": id, "max_seconds": r.max.as_secs() }).to_string(),
+        serde_json::json!({ "id": id, "max_seconds": r.max.as_secs(), "audio": with_audio })
+            .to_string(),
     )
         .into_response()
 }
@@ -332,6 +339,15 @@ pub async fn stop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_is_asked_for_with_audio_one_only() {
+        let query = |v: &str| HashMap::from([("audio".to_string(), v.to_string())]);
+        assert!(!audio_requested(&HashMap::new()));
+        assert!(audio_requested(&query("1")));
+        assert!(!audio_requested(&query("0")));
+        assert!(!audio_requested(&query("")));
+    }
 
     #[test]
     fn record_len_is_positive_and_capped() {
