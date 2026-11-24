@@ -12,6 +12,7 @@ use axum::response::{IntoResponse, Response};
 use base64::Engine;
 use std::collections::HashMap;
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 
 /// What the page fetches before it has the password, and the health check.
 const PUBLIC: &[&str] = &[
@@ -102,12 +103,8 @@ impl Login {
 }
 
 /// Compares in time that depends only on the lengths, not on where the bytes differ.
-fn same(a: &str, b: &str) -> bool {
-    a.len() == b.len()
-        && a.bytes()
-            .zip(b.bytes())
-            .fold(0, |diff, (x, y)| diff | (x ^ y))
-            == 0
+pub(crate) fn same(a: &str, b: &str) -> bool {
+    a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 
 /// 128 random bits as 32 hex digits.

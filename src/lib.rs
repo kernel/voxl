@@ -195,6 +195,22 @@ async fn serve(a: HashMap<String, String>) {
     // commands watching needs are accepted (see server::READ_ONLY_COMMANDS), uploads
     // are refused, and the page hides the controls that would send anything else.
     let read_only = truthy(a.get("read-only"), false);
+    // --control-password: viewers that connect with it drive, the rest only watch.
+    let control_password = a
+        .get("control-password")
+        .cloned()
+        .or_else(|| std::env::var("VOXL_CONTROL_PASSWORD").ok())
+        .filter(|p| !p.is_empty());
+    let control = if read_only {
+        if control_password.is_some() {
+            log::warn!("--control-password is ignored with --read-only: no viewer drives");
+        }
+        server::Control::Nobody
+    } else {
+        control_password.map_or(server::Control::Everyone, |p| {
+            server::Control::Password(p.into())
+        })
+    };
     // --enable-resize (as in selkies): clients resize the desktop to their window. Not
     // for read-only viewers: a new size changes the desktop for everyone.
     let enable_resize = truthy(a.get("enable-resize"), false);
@@ -325,9 +341,6 @@ async fn serve(a: HashMap<String, String>) {
         extra.insert("os".into(), std::env::consts::OS.into());
         extra.insert("audio".into(), audio_on.into());
         extra.insert("mic".into(), mic.is_some().into());
-        if read_only {
-            extra.insert("readOnly".into(), true.into());
-        }
         extra.insert(
             "files".into(),
             serde_json::json!({"upload": files.upload, "download": files.download, "dir": files.default_dir}),
@@ -352,7 +365,7 @@ async fn serve(a: HashMap<String, String>) {
         files,
         mic,
         resize: enable_resize && !read_only,
-        read_only,
+        control,
         // GET /screenshot, /record; --max-record-seconds caps a recording's length.
         recorder: record::Recorder::new(
             hub.clone(),

@@ -1,9 +1,9 @@
 //! HTTP + WebSocket front end. Serves the embedded web client and the media/input socket.
 
-use crate::hub::{Client, Hub, Out};
+use crate::hub::{Access, Client, Hub, Out};
 use crate::input::InputEvent;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -24,8 +24,7 @@ pub struct AppState {
     pub mic: Option<std::sync::mpsc::Sender<crate::mic::MicMsg>>,
     /// Resizing was enabled; hub.resize_max tracks the current display's capability.
     pub resize: bool,
-    /// Viewers only watch: input, clipboard writes and the microphone are refused (--read-only).
-    pub read_only: bool,
+    pub control: Control,
     pub recorder: Arc<crate::record::Recorder>,
     /// The web client's page, with its title filled in (`index_html`).
     pub index: Bytes,
@@ -203,12 +202,47 @@ async fn stats(State(s): State<AppState>) -> Response {
         .into_response()
 }
 
-async fn ws_handler(ws: WebSocketUpgrade, State(s): State<AppState>) -> Response {
-    ws.max_message_size(64 << 20)
-        .on_upgrade(move |socket| handle_socket(socket, s))
+/// Which viewers drive the desktop; the rest only watch.
+#[derive(Clone)]
+pub enum Control {
+    Everyone,
+    /// Only a socket opened with this as `?password=` (--control-password): the
+    /// parameter neko clients sign in with, which a proxy in front can set per viewer.
+    Password(Arc<str>),
+    /// --read-only.
+    Nobody,
 }
 
-async fn handle_socket(socket: WebSocket, s: AppState) {
+impl Control {
+    fn access(&self, password: Option<&str>) -> Access {
+        match self {
+            Control::Everyone => Access::Drive,
+            Control::Password(want)
+                if password.is_some_and(|given| crate::login::same(given, want)) =>
+            {
+                Access::Drive
+            }
+            Control::Password(_) | Control::Nobody => Access::Watch,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct WsQuery {
+    password: Option<String>,
+}
+
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(s): State<AppState>,
+    Query(q): Query<WsQuery>,
+) -> Response {
+    let access = s.control.access(q.password.as_deref());
+    ws.max_message_size(64 << 20)
+        .on_upgrade(move |socket| handle_socket(socket, s, access))
+}
+
+async fn handle_socket(socket: WebSocket, s: AppState, access: Access) {
     use futures_util::{SinkExt, StreamExt};
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Out>();
@@ -220,10 +254,10 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
         if input.is_none() && s.hub.input_floor.load(Ordering::Relaxed) != 0 {
             return;
         }
-        s.hub.add_client(tx)
+        s.hub.add_client(tx, access)
     };
     log::info!("client {} connected", client.id);
-    client.send(Out::Text(s.hub.hello()));
+    client.send(Out::Text(s.hub.hello(client.access)));
     if let Some(c) = s.hub.cursor.lock().clone() {
         client.send(Out::Bin(c));
     }
@@ -266,7 +300,7 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
             Message::Text(t) => handle_text(&s, &client, t.as_str(), &mut rtts),
             // Every binary message from a viewer acts on the desktop (clipboard images,
             // microphone audio), so a read-only viewer's are all dropped.
-            Message::Binary(_) if s.read_only => {}
+            Message::Binary(_) if client.access == Access::Watch => {}
             // 0x11: clipboard image (PNG) pasted on the client.
             Message::Binary(b) if b.first() == Some(&0x11) && b.len() > 1 => {
                 send_input(
@@ -292,7 +326,11 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
     }
     pinger.abort();
     writer.abort();
-    send_input(&s.hub, &client, InputEvent::ReleaseAll);
+    // Releasing every held key and button acts on the desktop, so a read-only viewer
+    // leaving must not end a driver's drag.
+    if client.access == Access::Drive {
+        send_input(&s.hub, &client, InputEvent::ReleaseAll);
+    }
     if let Some(tx) = &s.mic {
         let _ = tx.send(crate::mic::MicMsg::Stop(client.id));
     }
@@ -324,10 +362,10 @@ const READ_ONLY_COMMANDS: &[&str] = &["a", "v", "au", "kf", "po"];
 
 fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collections::VecDeque<u32>) {
     let (cmd, rest) = t.split_once(',').unwrap_or((t, ""));
-    // --read-only: accept only what watching needs, right where commands are applied,
-    // so a client that ignores the hello flag cannot drive the desktop, whatever
-    // commands are added later.
-    if s.read_only && !READ_ONLY_COMMANDS.contains(&cmd) {
+    // Read-only viewers: accept only what watching needs, right where commands are
+    // applied, so a client that ignores the hello flag cannot drive the desktop,
+    // whatever commands are added later.
+    if c.access == Access::Watch && !READ_ONLY_COMMANDS.contains(&cmd) {
         return;
     }
     let input = |ev| send_input(&s.hub, c, ev);
@@ -343,7 +381,7 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
                             log::warn!("display switch: {e}");
                         }
                         c.needs_keyframe.store(true, Ordering::Relaxed);
-                        c.send(Out::Text(s.hub.hello()));
+                        c.send(Out::Text(s.hub.hello(c.access)));
                         s.hub.wake();
                     }
                 }
@@ -481,7 +519,7 @@ mod tests {
 
     /// Sends every command to a server that has input, a microphone and resizing wired
     /// up, and returns (input events, microphone messages, a resize was asked for).
-    fn drive(read_only: bool) -> (usize, usize, bool) {
+    fn drive(access: Access) -> (usize, usize, bool) {
         let hub = Hub::new();
         hub.width.store(1280, Ordering::Relaxed);
         hub.height.store(800, Ordering::Relaxed);
@@ -502,14 +540,14 @@ mod tests {
             }),
             mic: Some(mic_tx),
             resize: true,
-            read_only,
+            control: Control::Everyone,
             recorder: crate::record::Recorder::new(hub.clone(), Duration::from_secs(1)),
             index: Bytes::new(),
             favicon: Bytes::new(),
             favicon_type: "image/x-icon",
         };
         let (tx, _rx) = mpsc::unbounded_channel();
-        let client = hub.add_client(tx);
+        let client = hub.add_client(tx, access);
         let mut rtts = Default::default();
         for c in ALL {
             handle_text(&s, &client, c, &mut rtts);
@@ -524,7 +562,7 @@ mod tests {
 
     #[test]
     fn read_only_viewers_cannot_act_on_the_desktop() {
-        let (input, mic, resized) = drive(true);
+        let (input, mic, resized) = drive(Access::Watch);
         assert_eq!(input, 0, "input events from a read-only viewer");
         assert_eq!(mic, 0, "microphone messages from a read-only viewer");
         assert!(!resized, "a read-only viewer resized the desktop");
@@ -534,10 +572,46 @@ mod tests {
     fn other_viewers_still_can() {
         // The same commands do reach the desktop without --read-only, so the test above
         // checks the guard rather than an unwired server.
-        let (input, mic, resized) = drive(false);
+        let (input, mic, resized) = drive(Access::Drive);
         assert!(input >= 9, "{input} input events");
         assert_eq!(mic, 1);
         assert!(resized);
+    }
+
+    #[test]
+    fn only_the_control_password_drives() {
+        let password = Control::Password("admin".into());
+        assert_eq!(password.access(Some("admin")), Access::Drive);
+        assert_eq!(password.access(Some("view")), Access::Watch);
+        assert_eq!(password.access(None), Access::Watch);
+        assert_eq!(Control::Everyone.access(None), Access::Drive);
+        assert_eq!(Control::Nobody.access(Some("admin")), Access::Watch);
+    }
+
+    #[test]
+    fn read_only_viewers_are_told_so_and_not_sent_the_clipboard() {
+        let hub = Hub::new();
+        {
+            let mut extra = hub.hello_extra.lock();
+            extra.insert("files".into(), serde_json::json!({"upload": true}));
+            extra.insert("resize".into(), serde_json::json!({"scale": 1.0}));
+        }
+        let (tx, mut viewer) = mpsc::unbounded_channel();
+        hub.add_client(tx, Access::Watch);
+        let (tx, mut driver) = mpsc::unbounded_channel();
+        hub.add_client(tx, Access::Drive);
+        let hello = |a| serde_json::from_str::<serde_json::Value>(&hub.hello(a)).unwrap();
+        let (watch, drive) = (hello(Access::Watch), hello(Access::Drive));
+        assert_eq!(watch["readOnly"], true);
+        assert_eq!(watch["files"]["upload"], false);
+        assert_eq!(watch.get("resize"), None);
+        assert_eq!(drive.get("readOnly"), None);
+        assert_eq!(drive["files"]["upload"], true);
+        assert!(drive.get("resize").is_some());
+
+        hub.broadcast_clipboard(|| Out::Text("clip".into()));
+        assert!(viewer.try_recv().is_err());
+        assert!(driver.try_recv().is_ok());
     }
 
     #[test]
@@ -565,7 +639,7 @@ mod tests {
         let (sender, events) = std::sync::mpsc::channel();
         *hub.input.lock() = Some(sender);
         let (out, _messages) = mpsc::unbounded_channel();
-        let old = hub.add_client(out);
+        let old = hub.add_client(out, Access::Drive);
         send_input(&hub, &old, InputEvent::Move { x: 1, y: 2 });
         let request = hub.pause_display_input(20, old.id).unwrap();
         assert!(
@@ -601,7 +675,7 @@ mod tests {
         );
         assert!(hub.pause_display_input(30, old.id).is_none());
         let (out, _messages) = mpsc::unbounded_channel();
-        let fresh = hub.add_client(out);
+        let fresh = hub.add_client(out, Access::Drive);
         send_input(&hub, &fresh, InputEvent::Move { x: 3, y: 4 });
         assert!(matches!(
             events.try_recv(),

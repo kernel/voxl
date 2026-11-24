@@ -1732,6 +1732,7 @@ dependencies = [
  "rcgen",
  "serde",
  "serde_json",
+ "subtle",
  "tokio",
  "tokio-rustls",
  "vcpkg",
