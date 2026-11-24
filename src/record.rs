@@ -5,8 +5,8 @@
 //! - `POST /record/start` -> `{"id": n}`, then `POST /record/stop?id=n`: returns an MP4
 //!   of everything in between.
 //!
-//! Desktop audio is opt-in per request, as it is per viewer on the live stream: add
-//! `audio=1`, and only when the server runs with `--audio-enabled` (the default).
+//! Both include desktop audio when the server has it (`--audio-enabled`, the default),
+//! unless asked for `audio=0`, as a live viewer keeps audio on until it turns it off.
 //! `/record/start` reports whether its recording includes audio.
 //!
 //! A recording is the H.264 stream voxl already encodes, rewrapped as MP4: the recorder
@@ -247,9 +247,9 @@ async fn collect(
         .map_err(|e| e.to_string())?
 }
 
-/// Whether the request asks for desktop audio: `audio=1`, as the live stream's `au,1`.
-fn audio_requested(q: &HashMap<String, String>) -> bool {
-    q.get("audio").map(String::as_str) == Some("1")
+/// Whether the request keeps desktop audio: unless `audio=0` or `audio=false`.
+fn audio_wanted(q: &HashMap<String, String>) -> bool {
+    !matches!(q.get("audio").map(String::as_str), Some("0" | "false"))
 }
 
 /// How long `GET /record?seconds=` records: `secs`, at most `max`. None unless positive.
@@ -272,7 +272,7 @@ pub async fn record(
     };
     // The deadline ends it; the stop side is never used.
     let (_keep, stop) = oneshot::channel();
-    let done = match begin(&r, stop, len, r.audio && audio_requested(&q)) {
+    let done = match begin(&r, stop, len, r.audio && audio_wanted(&q)) {
         Ok(d) => d,
         Err(e) => return e,
     };
@@ -288,7 +288,7 @@ pub async fn start(
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
     let (stop_tx, stop) = oneshot::channel();
-    let with_audio = r.audio && audio_requested(&q);
+    let with_audio = r.audio && audio_wanted(&q);
     let done = match begin(&r, stop, r.max, with_audio) {
         Ok(d) => d,
         Err(e) => return e,
@@ -341,12 +341,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn audio_is_asked_for_with_audio_one_only() {
+    fn audio_is_on_unless_turned_off() {
         let query = |v: &str| HashMap::from([("audio".to_string(), v.to_string())]);
-        assert!(!audio_requested(&HashMap::new()));
-        assert!(audio_requested(&query("1")));
-        assert!(!audio_requested(&query("0")));
-        assert!(!audio_requested(&query("")));
+        assert!(audio_wanted(&HashMap::new()));
+        assert!(audio_wanted(&query("1")));
+        assert!(!audio_wanted(&query("0")));
+        assert!(!audio_wanted(&query("false")));
     }
 
     #[test]
