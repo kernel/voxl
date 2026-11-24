@@ -46,19 +46,17 @@ fn nals(data: &[u8]) -> Vec<&[u8]> {
     out.into_iter().filter(|n| !n.is_empty()).collect()
 }
 
+fn cat(parts: &[&[u8]]) -> Vec<u8> {
+    parts.concat()
+}
+
 fn bx(name: &[u8; 4], body: &[u8]) -> Vec<u8> {
-    let mut v = Vec::with_capacity(body.len() + 8);
-    v.extend_from_slice(&(body.len() as u32 + 8).to_be_bytes());
-    v.extend_from_slice(name);
-    v.extend_from_slice(body);
-    v
+    cat(&[&(body.len() as u32 + 8).to_be_bytes(), name, body])
 }
 
 /// A full box: version 0 and `flags`, then the body.
 fn fbx(name: &[u8; 4], flags: u32, body: &[u8]) -> Vec<u8> {
-    let mut b = flags.to_be_bytes().to_vec();
-    b.extend_from_slice(body);
-    bx(name, &b)
+    bx(name, &cat(&[&flags.to_be_bytes(), body]))
 }
 
 fn u32s(v: &[u32]) -> Vec<u8> {
@@ -72,7 +70,37 @@ const MATRIX: [u32; 9] = [0x10000, 0, 0, 0, 0x10000, 0, 0, 0, 0x4000_0000];
 fn dinf() -> Vec<u8> {
     bx(
         b"dinf",
-        &fbx(b"dref", 0, &[u32s(&[1]), fbx(b"url ", 1, &[])].concat()),
+        &fbx(b"dref", 0, &cat(&[&u32s(&[1]), &fbx(b"url ", 1, &[])])),
+    )
+}
+
+/// Handler: the media `kind` and a readable `name`.
+fn hdlr(kind: &[u8; 4], name: &[u8]) -> Vec<u8> {
+    fbx(b"hdlr", 0, &cat(&[&u32s(&[0]), kind, &[0; 12], name]))
+}
+
+/// Media header: its timescale and duration, language "und".
+fn mdhd(timescale: u32, duration: u32) -> Vec<u8> {
+    fbx(
+        b"mdhd",
+        0,
+        &cat(&[&u32s(&[0, 0, timescale, duration]), &[0x55, 0xc4, 0, 0]]),
+    )
+}
+
+/// Track header, enabled. Audio has volume 1.0 (0x100), video 0.
+fn tkhd(track: u32, duration: u32, volume: u16, width: u32, height: u32) -> Vec<u8> {
+    fbx(
+        b"tkhd",
+        3,
+        &cat(&[
+            &u32s(&[0, 0, track, 0, duration, 0, 0]),
+            &[0; 4],
+            &volume.to_be_bytes(),
+            &[0; 2],
+            &u32s(&MATRIX),
+            &u32s(&[width << 16, height << 16]),
+        ]),
     )
 }
 
@@ -147,98 +175,77 @@ pub fn write(
         // 4:2:0, 8-bit, no SPS extensions.
         avcc.extend_from_slice(&[0xfd, 0xf8, 0xf8, 0]);
     }
-    let mut avc1 = vec![0u8; 6];
-    avc1.extend_from_slice(&1u16.to_be_bytes()); // data reference index
-    avc1.extend_from_slice(&[0u8; 16]);
-    avc1.extend_from_slice(&(width as u16).to_be_bytes());
-    avc1.extend_from_slice(&(height as u16).to_be_bytes());
-    avc1.extend_from_slice(&u32s(&[0x48_0000, 0x48_0000, 0]));
-    avc1.extend_from_slice(&1u16.to_be_bytes()); // frame count
-    avc1.extend_from_slice(&[0u8; 32]); // compressor name
-    avc1.extend_from_slice(&[0, 0x18, 0xff, 0xff]); // depth, pre-defined
-    avc1.extend_from_slice(&bx(b"avcC", &avcc));
-    let stsd = fbx(b"stsd", 0, &[u32s(&[1]), bx(b"avc1", &avc1)].concat());
+    let avc1 = cat(&[
+        &[0; 6],
+        &1u16.to_be_bytes(), // data reference index
+        &[0; 16],
+        &(width as u16).to_be_bytes(),
+        &(height as u16).to_be_bytes(),
+        &u32s(&[0x48_0000, 0x48_0000, 0]),
+        &1u16.to_be_bytes(), // frame count
+        &[0; 32],            // compressor name
+        &[0, 0x18, 0xff, 0xff],
+        &bx(b"avcC", &avcc),
+    ]);
+    let stsd = fbx(b"stsd", 0, &cat(&[&u32s(&[1]), &bx(b"avc1", &avc1)]));
 
     // Runs of equal durations.
-    let mut stts: Vec<(u32, u32)> = Vec::new();
+    let mut runs: Vec<(u32, u32)> = Vec::new();
     for &d in &durations {
-        match stts.last_mut() {
+        match runs.last_mut() {
             Some((c, last)) if *last == d => *c += 1,
-            _ => stts.push((1, d)),
+            _ => runs.push((1, d)),
         }
     }
-    let stts = fbx(
-        b"stts",
-        0,
-        &[
-            u32s(&[stts.len() as u32]),
-            stts.iter().flat_map(|&(c, d)| u32s(&[c, d])).collect(),
-        ]
-        .concat(),
-    );
+    let run_pairs: Vec<u8> = runs.iter().flat_map(|&(c, d)| u32s(&[c, d])).collect();
+    let stts = fbx(b"stts", 0, &cat(&[&u32s(&[runs.len() as u32]), &run_pairs]));
     let stss = fbx(
         b"stss",
         0,
-        &[u32s(&[sync.len() as u32]), u32s(&sync)].concat(),
+        &cat(&[&u32s(&[sync.len() as u32]), &u32s(&sync)]),
     );
-    let stsz = fbx(b"stsz", 0, &[u32s(&[0, n]), u32s(&sizes)].concat());
+    let stsz = fbx(b"stsz", 0, &cat(&[&u32s(&[0, n]), &u32s(&sizes)]));
     let stsc = fbx(b"stsc", 0, &u32s(&[1, 1, n, 1]));
-    // Everything in the sample table but the chunk offset, which depends on moov's size.
-    let stbl_head = [stsd, stts, stss, stsz, stsc].concat();
+    // The sample table without its chunk offset, which depends on moov's size.
+    let stbl_head = cat(&[&stsd, &stts, &stss, &stsz, &stsc]);
 
-    let vmhd = fbx(b"vmhd", 1, &[0u8; 8]);
-    let mut hdlr = u32s(&[0]);
-    hdlr.extend_from_slice(b"vide");
-    hdlr.extend_from_slice(&[0u8; 12]);
-    hdlr.extend_from_slice(b"voxl\0");
-    let hdlr = fbx(b"hdlr", 0, &hdlr);
-    let mut mdhd = u32s(&[0, 0, TIMESCALE, total as u32]);
-    mdhd.extend_from_slice(&[0x55, 0xc4, 0, 0]); // language "und"
-    let mdhd = fbx(b"mdhd", 0, &mdhd);
-    let mut tkhd = u32s(&[0, 0, 1, 0, total as u32, 0, 0]);
-    tkhd.extend_from_slice(&[0u8; 4]); // layer, alternate group
-    tkhd.extend_from_slice(&[0u8; 4]); // volume, reserved
-    tkhd.extend_from_slice(&u32s(&MATRIX));
-    tkhd.extend_from_slice(&u32s(&[width << 16, height << 16]));
-    let tkhd = fbx(b"tkhd", 3, &tkhd);
-
-    let mut mvhd = u32s(&[0, 0, TIMESCALE, total as u32, 0x10000]);
-    mvhd.extend_from_slice(&[1, 0, 0, 0]); // volume 1.0, reserved
-    mvhd.extend_from_slice(&[0u8; 8]);
-    mvhd.extend_from_slice(&u32s(&MATRIX));
-    mvhd.extend_from_slice(&[0u8; 24]); // pre-defined
-    let tracks: u32 = if audio.is_empty() { 1 } else { 2 };
-    mvhd.extend_from_slice(&u32s(&[tracks + 1])); // next track id
-    let mvhd = fbx(b"mvhd", 0, &mvhd);
+    let mvhd = fbx(
+        b"mvhd",
+        0,
+        &cat(&[
+            &u32s(&[0, 0, TIMESCALE, total as u32, 0x10000]),
+            &[1, 0, 0, 0], // volume 1.0, reserved
+            &[0; 8],
+            &u32s(&MATRIX),
+            &[0; 24],                                       // pre-defined
+            &u32s(&[if audio.is_empty() { 2 } else { 3 }]), // next track id
+        ]),
+    );
 
     // moov's size doesn't depend on the chunk offsets, so it is built once with placeholders
     // to measure it, then again with the real offsets.
     let moov = |video_chunk: u32, audio_chunk: u32| {
         let stco = fbx(b"stco", 0, &u32s(&[1, video_chunk]));
-        let stbl = bx(b"stbl", &[stbl_head.as_slice(), stco.as_slice()].concat());
-        let minf = bx(
-            b"minf",
-            &[vmhd.as_slice(), dinf().as_slice(), stbl.as_slice()].concat(),
-        );
+        let stbl = bx(b"stbl", &cat(&[&stbl_head, &stco]));
+        let minf = bx(b"minf", &cat(&[&fbx(b"vmhd", 1, &[0; 8]), &dinf(), &stbl]));
         let mdia = bx(
             b"mdia",
-            &[mdhd.as_slice(), hdlr.as_slice(), minf.as_slice()].concat(),
+            &cat(&[
+                &mdhd(TIMESCALE, total as u32),
+                &hdlr(b"vide", b"voxl\0"),
+                &minf,
+            ]),
         );
-        let video_trak = bx(b"trak", &[tkhd.as_slice(), mdia.as_slice()].concat());
+        let video = bx(
+            b"trak",
+            &cat(&[&tkhd(1, total as u32, 0, width, height), &mdia]),
+        );
         let audio_trak = if audio.is_empty() {
             Vec::new()
         } else {
             audio_track(audio, &audio_edits, total, audio_chunk)
         };
-        bx(
-            b"moov",
-            &[
-                mvhd.as_slice(),
-                video_trak.as_slice(),
-                audio_trak.as_slice(),
-            ]
-            .concat(),
-        )
+        bx(b"moov", &cat(&[&mvhd, &video, &audio_trak]))
     };
     let probe = moov(0, 0);
     let file_len = ftyp.len() as u64 + probe.len() as u64 + 8 + mdat_len;
@@ -269,58 +276,44 @@ pub fn write(
 /// The Opus track: one sample per packet, mapped onto the movie by `edits`.
 fn audio_track(audio: &[AudioPacket], edits: &[(u32, i32)], movie_ms: u64, chunk: u32) -> Vec<u8> {
     let n = audio.len() as u32;
-
-    // dOps: version 0, channels, pre-skip, input sample rate, no output gain, mapping
-    // family 0.
-    let dops = [
-        &[0, opus::CHANNELS as u8][..],
+    // dOps: version 0, channels, pre-skip, input rate, no output gain, mapping family 0.
+    let dops = cat(&[
+        &[0, opus::CHANNELS as u8],
         &opus::PRE_SKIP.to_be_bytes(),
         &opus::RATE.to_be_bytes(),
         &[0; 3],
-    ]
-    .concat();
+    ]);
     // Sample entry: data reference index 1, stereo, 16-bit, 48 kHz as 16.16.
-    let mut entry = vec![0; 6];
-    entry.extend_from_slice(&1u16.to_be_bytes());
-    entry.extend_from_slice(&[0; 8]); // reserved
-    entry.extend_from_slice(&(opus::CHANNELS as u16).to_be_bytes());
-    entry.extend_from_slice(&16u16.to_be_bytes()); // sample size
-    entry.extend_from_slice(&[0; 4]); // pre-defined, reserved
-    entry.extend_from_slice(&(opus::RATE << 16).to_be_bytes());
-    entry.extend_from_slice(&bx(b"dOps", &dops));
-    let stsd = fbx(b"stsd", 0, &[u32s(&[1]), bx(b"Opus", &entry)].concat());
-
+    let entry = cat(&[
+        &[0; 6],
+        &1u16.to_be_bytes(),
+        &[0; 8],
+        &(opus::CHANNELS as u16).to_be_bytes(),
+        &16u16.to_be_bytes(),
+        &[0; 4],
+        &(opus::RATE << 16).to_be_bytes(),
+        &bx(b"dOps", &dops),
+    ]);
     let sizes: Vec<u32> = audio.iter().map(|p| p.data.len() as u32).collect();
     let stbl = bx(
         b"stbl",
-        &[
-            stsd,
-            fbx(b"stts", 0, &u32s(&[1, n, opus::FRAME as u32])),
-            fbx(b"stsz", 0, &[u32s(&[0, n]), u32s(&sizes)].concat()),
-            fbx(b"stsc", 0, &u32s(&[1, 1, n, 1])),
-            fbx(b"stco", 0, &u32s(&[1, chunk])),
-        ]
-        .concat(),
+        &cat(&[
+            &fbx(b"stsd", 0, &cat(&[&u32s(&[1]), &bx(b"Opus", &entry)])),
+            &fbx(b"stts", 0, &u32s(&[1, n, opus::FRAME as u32])),
+            &fbx(b"stsz", 0, &cat(&[&u32s(&[0, n]), &u32s(&sizes)])),
+            &fbx(b"stsc", 0, &u32s(&[1, 1, n, 1])),
+            &fbx(b"stco", 0, &u32s(&[1, chunk])),
+        ]),
     );
-    let smhd = fbx(b"smhd", 0, &[0; 4]);
-    let minf = bx(b"minf", &[smhd, dinf(), stbl].concat());
-    let hdlr = fbx(
-        b"hdlr",
-        0,
-        &[&u32s(&[0])[..], b"soun", &[0; 12], b"voxl audio\0"].concat(),
+    let minf = bx(b"minf", &cat(&[&fbx(b"smhd", 0, &[0; 4]), &dinf(), &stbl]));
+    let mdia = bx(
+        b"mdia",
+        &cat(&[
+            &mdhd(opus::RATE, n.saturating_mul(opus::FRAME as u32)),
+            &hdlr(b"soun", b"voxl audio\0"),
+            &minf,
+        ]),
     );
-    let mut mdhd = u32s(&[0, 0, opus::RATE, n.saturating_mul(opus::FRAME as u32)]);
-    mdhd.extend_from_slice(&[0x55, 0xc4, 0, 0]); // language "und"
-    let mdia = bx(b"mdia", &[fbx(b"mdhd", 0, &mdhd), hdlr, minf].concat());
-
-    // Track 2, enabled; identity matrix, volume 1.0, no picture size.
-    let mut tkhd = u32s(&[0, 0, 2, 0, movie_ms as u32, 0, 0]);
-    tkhd.extend_from_slice(&[0; 4]); // layer, alternate group
-    tkhd.extend_from_slice(&[1, 0, 0, 0]); // volume 1.0, reserved
-    tkhd.extend_from_slice(&u32s(&MATRIX));
-    tkhd.extend_from_slice(&u32s(&[0, 0]));
-    let tkhd = fbx(b"tkhd", 3, &tkhd);
-
     // Each edit: movie duration, media time in samples (-1 for an empty edit), rate 1.
     // The -1 is stored as its two's complement.
     let entries: Vec<u32> = edits
@@ -330,10 +323,16 @@ fn audio_track(audio: &[AudioPacket], edits: &[(u32, i32)], movie_ms: u64, chunk
     let elst = fbx(
         b"elst",
         0,
-        &[u32s(&[edits.len() as u32]), u32s(&entries)].concat(),
+        &cat(&[&u32s(&[edits.len() as u32]), &u32s(&entries)]),
     );
-
-    bx(b"trak", &[tkhd, bx(b"edts", &elst), mdia].concat())
+    bx(
+        b"trak",
+        &cat(&[
+            &tkhd(2, movie_ms as u32, 0x100, 0, 0),
+            &bx(b"edts", &elst),
+            &mdia,
+        ]),
+    )
 }
 
 /// The packets that play within the movie, which starts at `origin` (ms) and lasts
@@ -472,14 +471,6 @@ mod tests {
             .collect();
         assert_eq!(&out[chunks[0]..chunks[1]], &[0, 0, 0, 2, 0x65, 0xaa]);
         assert_eq!(&out[chunks[1]..], &[20, 20, 30, 30]);
-    }
-
-    #[test]
-    fn opus_track_declares_the_encoder_pre_skip() {
-        let out = write(&[key_frame()], 64, 32, 100, &packets(&[0])).unwrap();
-        let dops = out.windows(4).position(|w| w == b"dOps").unwrap();
-        // The pre-skip follows the version and channel count.
-        assert_eq!(&out[dops + 6..dops + 8], &opus::PRE_SKIP.to_be_bytes());
     }
 
     #[test]

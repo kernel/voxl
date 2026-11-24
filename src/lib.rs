@@ -34,12 +34,6 @@ mod mic;
 mod mp4;
 mod opus;
 mod record;
-#[cfg(any(
-    all(target_os = "linux", feature = "pulseaudio"),
-    target_os = "macos",
-    windows
-))]
-mod record_audio;
 #[cfg(target_os = "linux")]
 mod screen;
 mod server;

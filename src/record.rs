@@ -139,24 +139,6 @@ pub async fn screenshot(State(r): State<Arc<Recorder>>) -> Response {
     }
 }
 
-/// Desktop audio packets for a recording, or none for a video-only one.
-struct AudioIn(Option<mpsc::UnboundedReceiver<(Instant, Bytes)>>);
-
-impl AudioIn {
-    /// The next captured packet. Once the audio ends, or for video-only recordings,
-    /// this waits forever.
-    async fn next(&mut self) -> Option<(Instant, Bytes)> {
-        let Some(rx) = self.0.as_mut() else {
-            return std::future::pending().await;
-        };
-        let packet = rx.recv().await;
-        if packet.is_none() {
-            self.0 = None;
-        }
-        packet
-    }
-}
-
 /// Joins as a viewer and collects frames until `stop`, `max` or a geometry change.
 #[allow(clippy::result_large_err)]
 fn begin(
@@ -175,10 +157,10 @@ fn begin(
     let client = r.hub.add_client(tx);
     client.video.store(true, Ordering::Relaxed);
     r.hub.wake();
-    let audio = AudioIn(with_audio.then(|| r.hub.subscribe_audio()));
+    let audio = r.hub.subscribe_audio(with_audio);
     let hub = r.hub.clone();
     Ok(tokio::spawn(async move {
-        let res = collect(&hub, &client, rx, audio, stop, max).await;
+        let res = collect(&hub, &client, rx, audio, with_audio, stop, max).await;
         hub.remove_client(client.id);
         res
     }))
@@ -196,7 +178,8 @@ async fn collect(
     hub: &Hub,
     client: &Client,
     mut rx: mpsc::UnboundedReceiver<Out>,
-    mut audio: AudioIn,
+    mut audio: mpsc::UnboundedReceiver<(Instant, Bytes)>,
+    with_audio: bool,
     mut stop: oneshot::Receiver<()>,
     max: Duration,
 ) -> Result<Vec<u8>, String> {
@@ -210,10 +193,8 @@ async fn collect(
         tokio::select! {
             _ = &mut stop => break,
             _ = &mut deadline => break,
-            captured = audio.next() => {
-                if let Some((at, data)) = captured {
-                    packets.push(mp4::AudioPacket { ms: offset_ms(at, start), data });
-                }
+            Some((at, data)) = audio.recv(), if with_audio => {
+                packets.push(mp4::AudioPacket { ms: offset_ms(at, start), data });
             }
             m = rx.recv() => match m {
                 None => break,

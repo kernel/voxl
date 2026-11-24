@@ -334,10 +334,12 @@ impl Hub {
         self.wake();
     }
 
-    /// A recording that takes desktop audio: its packets arrive here as they are captured.
-    pub fn subscribe_audio(&self) -> mpsc::UnboundedReceiver<(Instant, Bytes)> {
+    /// A recording's audio: packets arrive here as they are captured, when `on`.
+    pub fn subscribe_audio(&self, on: bool) -> mpsc::UnboundedReceiver<(Instant, Bytes)> {
         let (tx, rx) = mpsc::unbounded_channel();
-        self.audio_recorders.lock().push(tx);
+        if on {
+            self.audio_recorders.lock().push(tx);
+        }
         rx
     }
 

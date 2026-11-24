@@ -1,5 +1,5 @@
-//! The part of libopus voxl uses: one encoder for live and recorded desktop audio, and
-//! the stream constants the MP4 writer needs.
+//! The part of libopus voxl uses: one encoder for live and recorded desktop audio, and the
+//! stream constants the MP4 writer needs.
 #![cfg_attr(
     not(any(
         all(target_os = "linux", feature = "pulseaudio"),
@@ -12,17 +12,14 @@
 use std::ffi::{c_int, c_void};
 use std::ptr::NonNull;
 
-/// Sample rate of desktop audio.
 pub const RATE: u32 = 48_000;
 pub const CHANNELS: usize = 2;
-/// Samples per channel in one packet.
+/// Samples per channel in one 10 ms packet.
 pub const FRAME: usize = 480;
-/// Length of one packet.
 pub const FRAME_MS: i64 = 10;
 /// Interleaved samples in one packet.
 pub const FRAME_SAMPLES: usize = FRAME * CHANNELS;
-/// Lookahead of a restricted low-delay encoder at `RATE`: the decoder skips this many
-/// samples from the start of the stream (`dOps` pre-skip).
+/// Lookahead of a restricted low-delay encoder at `RATE`, which `dOps` declares as pre-skip.
 pub const PRE_SKIP: u16 = 120;
 
 const _: () = assert!(FRAME as u32 * 1000 == FRAME_MS as u32 * RATE);
@@ -54,7 +51,7 @@ extern "C" {
 }
 
 /// A libopus error code.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct Error(c_int);
 
 impl std::fmt::Display for Error {
@@ -62,8 +59,6 @@ impl std::fmt::Display for Error {
         write!(f, "opus error {}", self.0)
     }
 }
-
-impl std::error::Error for Error {}
 
 /// An Opus encoder for `RATE` stereo audio, tuned for low delay.
 pub struct Encoder {
@@ -96,7 +91,7 @@ impl Encoder {
     }
 
     /// Encodes one packet of interleaved stereo PCM (`FRAME_SAMPLES` samples). The result
-    /// borrows the encoder until the next call. It is empty when libopus emits nothing.
+    /// borrows the encoder until the next call, and is empty when libopus emits nothing.
     pub fn encode(&mut self, pcm: &[i16]) -> Result<&[u8], Error> {
         assert_eq!(pcm.len(), FRAME_SAMPLES);
         let n = unsafe {
