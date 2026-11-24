@@ -15,7 +15,7 @@ export interface App {
 	isMac: boolean;
 	/** The desktop is a Mac (from the server's hello). */
 	remoteMac: boolean;
-	/** The server only shows the desktop (--read-only), from the server's hello. */
+	/** The viewer only watches: the server's hello says so, or the page is locked. */
 	readOnly: boolean;
 	inIframe: boolean;
 	/** Desktop size in pixels; 0 until the server says hello. */
